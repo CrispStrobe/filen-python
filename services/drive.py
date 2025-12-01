@@ -1510,119 +1510,203 @@ class DriveService:
         return results
 
     # ============================================================================
-    # SEARCH AND FIND
+    # HELPER: OPTIMIZED TREE FETCHING
+    # ============================================================================
+
+    def _fetch_and_parse_tree(self, root_uuid: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, List[Any]]]:
+        """
+        Fetches the flat tree and organizes it for fast lookups.
+        Returns: (folder_map, file_list, children_adjacency_map)
+        """
+        # 1. Fetch from API
+        self._log(f"Fetching flat tree for {root_uuid}...")
+        tree_data = self.api.get_flat_folder_tree(root_uuid)
+        
+        raw_folders = tree_data.get('folders', [])
+        # Handle API variation ('files' vs 'uploads')
+        raw_files = tree_data.get('files', []) or tree_data.get('uploads', [])
+        
+        folder_map = {}   # UUID -> {name, parent}
+        adjacency = {}    # ParentUUID -> [ChildItems...] (for tree view)
+        files_clean = []  # List of normalized file objects
+        
+        # 2. Process Folders
+        for f in raw_folders:
+            # Handle List [uuid, name, parent] vs Dict
+            if isinstance(f, list):
+                if len(f) < 3: continue
+                uuid, enc_name, parent = f[0], f[1], f[2]
+            else:
+                if f.get('deleted') or f.get('trash'): continue
+                uuid, enc_name, parent = f.get('uuid'), f.get('name', ''), f.get('parent')
+
+            try:
+                dec_name = self._try_decrypt(enc_name)
+                if dec_name.startswith('{'):
+                    dec_name = json.loads(dec_name).get('name', 'Unknown')
+                
+                item = {'uuid': uuid, 'name': dec_name, 'parent': parent, 'type': 'folder'}
+                folder_map[uuid] = item
+                
+                # Add to adjacency list for tree view
+                if parent not in adjacency: adjacency[parent] = []
+                adjacency[parent].append(item)
+            except Exception:
+                continue
+
+        # 3. Process Files
+        for f in raw_files:
+            # Handle List [uuid, bucket, region, chunks, parent, meta] vs Dict
+            if isinstance(f, list):
+                if len(f) < 6: continue
+                # Correct indices based on your logs:
+                uuid, parent, enc_meta = f[0], f[4], f[5]
+            else:
+                if f.get('deleted') or f.get('trash'): continue
+                uuid, parent, enc_meta = f.get('uuid'), f.get('parent'), f.get('metadata', '')
+
+            try:
+                dec_meta = self._try_decrypt(enc_meta)
+                meta = json.loads(dec_meta)
+                
+                item = {
+                    'uuid': uuid, 
+                    'name': meta.get('name', 'Unknown'), 
+                    'parent': parent, 
+                    'type': 'file',
+                    'size': meta.get('size', 0),
+                    'lastModified': meta.get('lastModified', 0)
+                }
+                files_clean.append(item)
+                
+                # Add to adjacency list
+                if parent not in adjacency: adjacency[parent] = []
+                adjacency[parent].append(item)
+            except Exception:
+                continue
+                
+        return folder_map, files_clean, adjacency
+
+    # ============================================================================
+    # SEARCH AND FIND (OPTIMIZED)
     # ============================================================================
 
     def find_files(self, start_path: str, pattern: str, max_depth: int = -1) -> List[Dict[str, Any]]:
         """
-        Find files matching pattern
+        Find files matching pattern (Optimized using Tree endpoint)
         """
         import fnmatch
         
+        # 1. Resolve start node
+        try:
+            start_node = self.resolve_path(start_path)
+            if start_node['type'] != 'folder':
+                return []
+            start_uuid = start_node['uuid']
+        except Exception as e:
+            self._log(f"Find failed to resolve path: {e}")
+            return []
+
+        # 2. Fetch entire tree structure once
+        folder_map, file_list, _ = self._fetch_and_parse_tree(start_uuid)
+        
         results = []
         
-        # Stack for traversal: (path, depth)
-        stack = [(start_path, 0)]
+        # Helper to construct full path
+        def build_path(parent_uuid):
+            path_parts = []
+            curr = parent_uuid
+            # Safety brake for cycles
+            seen = set()
+            while curr and curr != start_uuid:
+                if curr in seen: break
+                seen.add(curr)
+                if curr not in folder_map: break # Orphaned
+                
+                folder = folder_map[curr]
+                path_parts.append(folder['name'])
+                curr = folder['parent']
+            
+            # Start path + relative path
+            base = start_path.rstrip('/')
+            rel = "/".join(reversed(path_parts))
+            return f"{base}/{rel}".rstrip('/') if rel else base
+
+        # 3. Iterate and Match
+        self._log(f"Filtering {len(file_list)} files against pattern '{pattern}'...")
         
-        while stack:
-            current_path, current_depth = stack.pop()
-            
-            if max_depth != -1 and current_depth >= max_depth:
-                continue
-            
-            try:
-                resolved = self.resolve_path(current_path)
-                if resolved['type'] != 'folder':
+        for file in file_list:
+            if fnmatch.fnmatch(file['name'], pattern):
+                
+                # Check depth if required
+                # (Optimization: Don't build full path if depth check fails)
+                # But calculating depth requires traversing parents anyway.
+                
+                parent_path_str = build_path(file['parent'])
+                full_path = f"{parent_path_str}/{file['name']}".replace('//', '/')
+                
+                # Calculate depth relative to start
+                # simple slash count difference
+                rel_depth = full_path.count('/') - start_path.strip('/').count('/')
+                
+                if max_depth != -1 and rel_depth > max_depth:
                     continue
-            except Exception as e:
-                self._log(f"Could not resolve: {current_path}")
-                continue
-            
-            current_uuid = resolved['uuid']
-            
-            # Check files
-            try:
-                files = self.list_files(current_uuid)
-                for file in files:
-                    name = file['name']
-                    
-                    if fnmatch.fnmatch(name, pattern):
-                        full_path = f"{current_path}/{name}".replace('//', '/')
-                        results.append({
-                            **file,
-                            'fullPath': full_path
-                        })
-            except Exception as e:
-                self._log(f"Could not list files in {current_path}: {e}")
-            
-            # Add subfolders to stack
-            if max_depth == -1 or (current_depth + 1) < max_depth:
-                try:
-                    folders = self.list_folders(current_uuid)
-                    for folder in folders:
-                        folder_name = folder['name']
-                        sub_path = f"{current_path}/{folder_name}".replace('//', '/')
-                        stack.append((sub_path, current_depth + 1))
-                except Exception as e:
-                    self._log(f"Could not list folders in {current_path}: {e}")
-        
+                
+                file['fullPath'] = full_path
+                results.append(file)
+                
         return results
 
     # ============================================================================
-    # TREE DISPLAY
+    # TREE DISPLAY (OPTIMIZED)
     # ============================================================================
 
     def print_tree(self, path: str, print_fn: Callable[[str], None], 
-                   max_depth: int = 3, current_depth: int = 0, prefix: str = "") -> None:
+                   max_depth: int = 3) -> None:
         """
-        Print folder tree
+        Print folder tree (Optimized using Tree endpoint)
         """
-        if current_depth >= max_depth:
-            return
-        
         try:
-            resolved = self.resolve_path(path)
-            if resolved['type'] != 'folder':
-                print_fn(f"{prefix}└── 📄 {os.path.basename(path)}")
-                return
-        except Exception as e:
-            print_fn(f"{prefix}└── ❌ Error: {e}")
-            return
-        
-        try:
-            uuid = resolved['uuid']
-            folders = self.list_folders(uuid)
-            files = self.list_files(uuid)
-            all_items = folders + files
-            
-            if not all_items:
+            # 1. Resolve Root
+            root = self.resolve_path(path)
+            if root['type'] != 'folder':
+                print_fn(f"└── 📄 {os.path.basename(path)}")
                 return
             
-            for i, item in enumerate(all_items):
-                is_last = (i == len(all_items) - 1)
+            root_uuid = root['uuid']
+            
+            # 2. Fetch Data Structure
+            _, _, adjacency = self._fetch_and_parse_tree(root_uuid)
+            
+            # 3. Recursive Print from Memory
+            def _print_node(parent_uuid, current_depth, prefix):
+                if current_depth >= max_depth:
+                    return
                 
-                connector = "└── " if is_last else "├── "
-                child_prefix = prefix + ("    " if is_last else "│   ")
+                children = adjacency.get(parent_uuid, [])
                 
-                name = item.get('name', 'Unknown')
+                # Sort: Folders first, then Files, both alphabetical
+                children.sort(key=lambda x: (x['type'] != 'folder', x['name'].lower()))
                 
-                if item['type'] == 'folder':
-                    folder_path = f"{path}/{name}".replace('//', '/')
-                    print_fn(f"{prefix}{connector}📁 {name}/")
+                count = len(children)
+                for i, item in enumerate(children):
+                    is_last = (i == count - 1)
+                    connector = "└── " if is_last else "├── "
                     
-                    self.print_tree(
-                        folder_path,
-                        print_fn,
-                        max_depth=max_depth,
-                        current_depth=current_depth + 1,
-                        prefix=child_prefix
-                    )
-                else:
-                    size = format_size(item.get('size', 0))
-                    print_fn(f"{prefix}{connector}📄 {name} ({size})")
-        
+                    if item['type'] == 'folder':
+                        print_fn(f"{prefix}{connector}📁 {item['name']}/")
+                        
+                        child_prefix = prefix + ("    " if is_last else "│   ")
+                        _print_node(item['uuid'], current_depth + 1, child_prefix)
+                    else:
+                        size = format_size(item.get('size', 0))
+                        print_fn(f"{prefix}{connector}📄 {item['name']} ({size})")
+
+            # Start printing
+            _print_node(root_uuid, 0, "")
+            
         except Exception as e:
-            print_fn(f"{prefix}└── ❌ Error: {e}")
+            print_fn(f"└── ❌ Error: {e}")
 
     # ============================================================================
     # VERIFY

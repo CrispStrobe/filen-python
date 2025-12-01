@@ -35,7 +35,6 @@ class APIClient:
         Get complete flattened folder tree for download (Single API call)
         """
         import uuid
-        # Device ID is required by the tree endpoint
         device_id = str(uuid.uuid4())
         
         self._log(f"Fetching flat tree for {folder_uuid} (DeviceID: {device_id})")
@@ -43,24 +42,15 @@ class APIClient:
         payload = {
             'uuid': folder_uuid,
             'deviceId': device_id,
-            'skipCache': 0  # FIXED: Send integer 0, not string
+            'skipCache': 0
         }
         
-        # Use /v3/dir/tree as it explicitly returns flattened 'files' and 'folders'
         response = self._request('POST', '/v3/dir/tree', payload)
         
         data = response.get('data', {})
-        # Debug summary of what we got back
         f_count = len(data.get('folders', []))
         u_count = len(data.get('uploads', []) or data.get('files', []))
         self._log(f"Tree fetched: {f_count} folders, {u_count} files")
-        
-        # Verify data types if in debug mode
-        if self.debug and f_count > 0:
-            first_folder = data.get('folders', [])[0]
-            self._log(f"Sample folder type: {type(first_folder)}")
-            if not isinstance(first_folder, dict):
-                self._log(f"⚠️  WARNING: Folders are {type(first_folder)}, expected dict!")
         
         return data
 

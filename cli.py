@@ -1039,62 +1039,103 @@ WebDAV Examples:
                 traceback.print_exc()
             return 1
 
-    def handle_trash(self, args) -> int:
-        """Handle trash command with wildcards"""
+    def handle_tree(self, args) -> int:
+        """Handle tree command - OPTIMIZED"""
         try:
             self._prepare_client()
             
-            # 1. Expand Wildcards
-            items = self._expand_remote_path(args.path)
+            print(f"\n🌳 Folder tree: {args.path}")
+            print("=" * 60)
+            print(args.path if args.path == '/' else f"📁 {os.path.basename(args.path)}")
             
-            # Get filter lists (might be None in argparse)
-            include = getattr(args, 'include', []) or []
-            exclude = getattr(args, 'exclude', []) or []
-            recursive = getattr(args, 'recursive', False)
+            # Now calls the optimized method in drive.py
+            self.drive.print_tree(
+                args.path,
+                lambda line: print(line),
+                max_depth=args.depth
+            )
             
-            # 2. Apply Filters
-            items_to_process = []
-            for item in items:
-                if self._should_process_item(item['name'], include, exclude):
-                    items_to_process.append(item)
-            
-            if not items_to_process:
-                print(f"❌ No items found matching '{args.path}'")
-                return 1
-
-            # 3. Confirmation
-            print(f"🔍 Found {len(items_to_process)} items to trash:")
-            for item in items_to_process[:10]:
-                print(f"  - {item['path']} ({item['type']})")
-            if len(items_to_process) > 10:
-                print(f"  ... and {len(items_to_process) - 10} more.")
-
-            if not self.force:
-                response = input(f"❓ Move these {len(items_to_process)} items to trash? [y/N]: ")
-                if response.lower() not in ['y', 'yes']:
-                    print("❌ Cancelled")
-                    return 0
-
-            # 4. Execution
-            success_count = 0
-            for item in items_to_process:
-                try:
-                    # Safety check for folders in wildcard mode
-                    if item['type'] == 'folder' and not recursive and ('*' in args.path or '?' in args.path):
-                         print(f"⚠️  Skipping folder '{item['name']}' (use -r to include folders in wildcard match)")
-                         continue
-
-                    print(f"🗑️ Moving \"{item['path']}\" to trash...")
-                    self.drive.trash_item(item['uuid'], item['type'])
-                    success_count += 1
-                except Exception as e:
-                    print(f"❌ Error trashing {item['name']}: {e}")
-
-            print(f"✅ Successfully moved {success_count} items to trash")
+            print(f"\n(Showing max {args.depth} levels deep)")
             return 0
         
         except Exception as e:
-            print(f"❌ Trash failed: {e}")
+            print(f"❌ Tree failed: {e}")
+            if self.debug:
+                import traceback
+                traceback.print_exc()
+            return 1
+
+    def handle_search(self, args) -> int:
+        """Handle search command (Global) - OPTIMIZED"""
+        try:
+            self._prepare_client()
+            
+            print(f"🔍 Searching for \"*{args.query}*\"...")
+            
+            # Use optimized find_files on root
+            # Note: This fetches the whole drive tree once, which is much faster 
+            # than 500 API calls, even for large accounts.
+            results = self.drive.find_files('/', f'*{args.query}*')
+            
+            # Apply Filters (Client side)
+            include = getattr(args, 'include', []) or []
+            exclude = getattr(args, 'exclude', []) or []
+            
+            filtered = []
+            for item in results:
+                if self._should_process_item(item['name'], include, exclude):
+                    filtered.append(item)
+
+            if not filtered:
+                print("   No matches found")
+                return 0
+                
+            print(f"\nFound {len(filtered)} matches:")
+            for item in filtered:
+                uuid_str = f" ({item['uuid']})" if args.uuids else ""
+                print(f"   {item['fullPath']}{uuid_str}")
+                
+            return 0
+            
+        except Exception as e:
+            print(f"❌ Search failed: {e}")
+            if self.debug:
+                import traceback
+                traceback.print_exc()
+            return 1
+
+    def handle_find(self, args) -> int:
+        """Handle find command - OPTIMIZED"""
+        try:
+            self._prepare_client()
+            
+            print(f"🔍 Finding \"{args.pattern}\" in \"{args.path}\"...")
+            
+            # Calls optimized drive method
+            results = self.drive.find_files(
+                args.path, 
+                args.pattern, 
+                max_depth=args.maxdepth
+            )
+            
+            # Apply Filters (Client side)
+            include = getattr(args, 'include', []) or []
+            exclude = getattr(args, 'exclude', []) or []
+            
+            filtered = [i for i in results if self._should_process_item(i['name'], include, exclude)]
+            
+            if not filtered:
+                print("   No matches found")
+                return 0
+                
+            print(f"\nFound {len(filtered)} matches:")
+            for item in filtered:
+                print(f"   {item['fullPath']}")
+                
+            return 0
+            
+        except Exception as e:
+            print(f"❌ Find failed: {e}")
             if self.debug:
                 import traceback
                 traceback.print_exc()
@@ -1578,68 +1619,6 @@ WebDAV Examples:
             return 1
         except Exception as e:
             print(f"❌ Error: {e}")
-            return 1
-
-    def handle_find(self, args) -> int:
-        """Handle find command"""
-        try:
-            self._prepare_client()
-            
-            print(f"🔍 Finding \"{args.pattern}\" in \"{args.path}\"...")
-            
-            results = self.drive.find_files(
-                args.path, 
-                args.pattern, 
-                max_depth=args.maxdepth
-            )
-            
-            if not results:
-                print("   No matches found")
-                return 0
-                
-            print(f"\nFound {len(results)} matches:")
-            for item in results:
-                print(f"   {item['fullPath']}")
-                
-            return 0
-            
-        except Exception as e:
-            print(f"❌ Find failed: {e}")
-            return 1
-
-    def handle_search(self, args) -> int:
-        """Handle search command with filtering"""
-        try:
-            self._prepare_client()
-            
-            print(f"🔍 Searching for \"{args.query}\"...")
-            
-            # This is server-side fuzzy search
-            results = self.drive.find_files('/', f'*{args.query}*')
-            
-            # Apply Client-side Filters
-            include = getattr(args, 'include', []) or []
-            exclude = getattr(args, 'exclude', []) or []
-            
-            filtered = []
-            for item in results:
-                # find_files returns objects with 'name', 'path', etc.
-                if self._should_process_item(item['name'], include, exclude):
-                    filtered.append(item)
-
-            if not filtered:
-                print("   No matches found")
-                return 0
-                
-            print(f"\nFound {len(filtered)} matches:")
-            for item in filtered:
-                uuid_str = f" ({item['uuid']})" if args.uuids else ""
-                print(f"   {item['fullPath']}{uuid_str}")
-                
-            return 0
-            
-        except Exception as e:
-            print(f"❌ Search failed: {e}")
             return 1
         
 def main():
