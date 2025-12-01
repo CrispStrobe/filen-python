@@ -12,6 +12,13 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Callable, Tuple, Iterator
 from datetime import datetime
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    # Fallback if not installed: return a dummy iterator
+    def tqdm(iterable=None, **kwargs):
+        return iterable if iterable else []
+
 from config.config import config_service
 from services.api import api_client
 from services.crypto import crypto_service
@@ -44,6 +51,7 @@ class DriveService:
         # Cache
         self._folder_cache = {}
         self._file_cache = {}
+        self._path_cache = {}  # Caches path strings to UUIDs
         self._cache_duration = 600  # 10 minutes
 
     def set_credentials(self, credentials: Dict[str, Any]) -> None:
@@ -71,6 +79,10 @@ class DriveService:
         """Invalidate cache for a folder"""
         self._folder_cache.pop(folder_uuid, None)
         self._file_cache.pop(folder_uuid, None)
+        
+        # Clear path cache on modification to be safe
+        self._path_cache = {} 
+        
         self._log(f"Cache invalidated for folder: {folder_uuid}")
 
     def _try_decrypt(self, encrypted: str) -> str:
@@ -377,7 +389,7 @@ class DriveService:
 
     def create_folder_recursive(self, path: str) -> Dict[str, Any]:
         """
-        Create folders recursively
+        Create folders recursively (Optimized with Path Cache)
         """
         if not self.base_folder_uuid:
             raise ValueError("Not logged in")
@@ -391,19 +403,34 @@ class DriveService:
                 'path': '/'
             }
         
+        # Check Cache
+        if path in self._path_cache:
+            return self._path_cache[path]
+        
         parts = path.split('/')
         current_uuid = self.base_folder_uuid
         current_path = '/'
         current_info = {'uuid': self.base_folder_uuid, 'name': 'Root', 'path': '/'}
         
+        # We try to find the deepest cached parent to start from
+        # We scan parts backwards later if needed, but linear forward is fine for now
+        
         for i, part in enumerate(parts):
             if not part:
                 continue
             
-            is_last = (i == len(parts) - 1)
-            part_path = f"{current_path}{part}/"
+            part_path_str = f"{current_path}{part}/".replace('//', '/')
+            clean_part_path = part_path_str.strip('/')
             
-            # Check if folder exists
+            # Check if this specific level is cached
+            if clean_part_path in self._path_cache:
+                cached = self._path_cache[clean_part_path]
+                current_uuid = cached['uuid']
+                current_info = cached
+                current_path = part_path_str
+                continue
+
+            # Check if folder exists in current_uuid
             folders = self.list_folders(current_uuid)
             found = None
             
@@ -415,9 +442,10 @@ class DriveService:
             if found:
                 current_uuid = found['uuid']
                 current_info = found
-                current_info['path'] = part_path.rstrip('/')
-                current_path = part_path
-                self._log(f"Found existing folder: {part}")
+                current_info['path'] = clean_part_path
+                current_path = part_path_str
+                # Cache this level
+                self._path_cache[clean_part_path] = current_info
             else:
                 # Create folder
                 self._log(f"Creating folder: {part} in {current_path}")
@@ -427,14 +455,12 @@ class DriveService:
                 except Exception as e:
                     # Handle 409 conflict
                     if '409' in str(e) or 'already exists' in str(e).lower():
-                        self._log('Conflict (409), re-fetching...')
                         import time
                         time.sleep(1)
                         self._invalidate_cache(current_uuid)
                     else:
                         raise
                 
-                # Re-fetch to get UUID
                 import time
                 time.sleep(0.5)
                 self._invalidate_cache(current_uuid)
@@ -451,9 +477,11 @@ class DriveService:
                 
                 current_uuid = new_folder['uuid']
                 current_info = new_folder
-                current_info['path'] = part_path.rstrip('/')
-                current_path = part_path
-                self._log(f"Created successfully: {part}")
+                current_info['path'] = clean_part_path
+                current_path = part_path_str
+                
+                # Cache new folder
+                self._path_cache[clean_part_path] = current_info
         
         return current_info
 
@@ -705,7 +733,7 @@ class DriveService:
             print("🔍 Building task list...")
             tasks = []
             
-            # Resolve target folder
+            # Resolve target folder (This now uses the path cache!)
             target_info = self.create_folder_recursive(target_path)
             target_uuid = target_info['uuid']
             self._log(f"Target folder UUID: {target_uuid}")
@@ -764,165 +792,191 @@ class DriveService:
             
             print(f"📝 Task list: {len(tasks)} files")
         
-        # Process tasks
+        # --- COUNTERS INITIALIZATION ---
         success_count = 0
         skipped_count = 0
         error_count = 0
         completed_previously = 0
         
-        for i, task in enumerate(tasks):
-            local_path = task['localPath']
-            remote_path = task['remotePath']
-            status = task['status']
-            file_uuid = task.get('fileUuid')
-            upload_key = task.get('uploadKey')
-            last_chunk = task.get('lastChunk', -1)
-            
-            # Debug
-            self._log(f"Processing task {i}: {Path(local_path).name}")
-            self._log(f"  Status: {status}")
-            self._log(f"  UUID: {file_uuid[:8] if file_uuid else 'None'}...")
-            self._log(f"  LastChunk: {last_chunk}")
-            
-            # Skip completed/skipped
-            if status == 'completed':
-                completed_previously += 1
-                continue
-            if status.startswith('skipped'):
-                skipped_count += 1
-                continue
-            
-            # Check local file exists
-            if not os.path.exists(local_path):
-                print(f"⚠️  Source missing: {Path(local_path).name}")
-                skipped_count += 1
-                task['status'] = 'skipped_missing'
-                if save_state_callback:
-                    save_state_callback(batch_state)
-                continue
-            
-            # Resolve parent folder
-            remote_parent = os.path.dirname(remote_path).replace('\\', '/')
-            remote_filename = os.path.basename(remote_path)
-            
-            try:
-                parent_info = self.create_folder_recursive(remote_parent)
-            except Exception as e:
-                print(f"❌ Error creating parent {remote_parent}: {e}")
-                error_count += 1
-                task['status'] = 'error_parent'
-                if save_state_callback:
-                    save_state_callback(batch_state)
-                continue
-            
-            # Check conflict (only for new uploads)
-            if not file_uuid:
-                name_hashed = self.crypto.hash_filename(remote_filename, self.email, self._get_master_key())
-                exists = self.api.check_file_exists(parent_info['uuid'], name_hashed)
+        # --- MODIFIED: TQDM Progress Bar Wrapper ---
+        with tqdm(total=len(tasks), unit="file", desc="Uploading", disable=None) as pbar:
+            for i, task in enumerate(tasks):
+                local_path = task['localPath']
+                remote_path = task['remotePath']
+                status = task['status']
+                file_uuid = task.get('fileUuid')
+                upload_key = task.get('uploadKey')
+                last_chunk = task.get('lastChunk', -1)
                 
-                if exists:
-                    if on_conflict == 'skip':
-                        print(f"⏭️  Skipping: {remote_filename} (exists)")
-                        skipped_count += 1
-                        task['status'] = 'skipped_conflict'
-                        if save_state_callback:
-                            save_state_callback(batch_state)
-                        continue
-            
-            # Upload file
-            try:
-                file_size = os.path.getsize(local_path)
+                # Update progress bar description with current filename
+                remote_filename = os.path.basename(remote_path)
+                pbar.set_description(f"Up: {remote_filename[:20]:<20}")
+
+                # Debug
+                self._log(f"Processing task {i}: {Path(local_path).name}")
+                self._log(f"  Status: {status}")
+                self._log(f"  UUID: {file_uuid[:8] if file_uuid else 'None'}...")
+                self._log(f"  LastChunk: {last_chunk}")
                 
-                is_resuming = (status in ['interrupted', 'uploading']) and last_chunk >= 0
+                # 1. Handle items completed in previous runs
+                if status == 'completed':
+                    completed_previously += 1
+                    pbar.update(1)
+                    continue
                 
-                if is_resuming:
-                    print(f"📤 Resuming: {remote_filename} from chunk {last_chunk + 1} ({format_size(file_size)})")
-                else:
-                    print(f"📤 Uploading: {remote_filename} ({format_size(file_size)})")
+                # 2. Handle Skipped/Pending items on resume
+                if status.startswith('skipped'):
+                    skipped_count += 1
+                    pbar.update(1)
+                    continue
                 
-                # Mark as uploading
-                task['status'] = 'uploading'
-                if save_state_callback:
-                    save_state_callback(batch_state)
-                
-                # Track saves
-                last_save_time = datetime.now()
-                last_saved_chunk = last_chunk
-                
-                def on_upload_start_handler(uuid: str, key: str):
-                    self._log(f"Upload started: uuid={uuid[:8]}..., key={key[:8]}...")
-                    task['fileUuid'] = uuid
-                    task['uploadKey'] = key
-                    task['lastChunk'] = -1
+                # 3. Check local file exists
+                if not os.path.exists(local_path):
+                    if self.debug: print(f"⚠️  Source missing: {Path(local_path).name}")
+                    skipped_count += 1
+                    task['status'] = 'skipped_missing'
                     if save_state_callback:
                         save_state_callback(batch_state)
+                    pbar.update(1)
+                    continue
                 
-                def on_progress_handler(current: int, total: int, bytes_up: int, total_bytes: int):
-                    nonlocal last_save_time, last_saved_chunk
-                    task['lastChunk'] = current - 1
-                    
-                    # Save periodically
-                    now = datetime.now()
-                    should_save = (current - last_saved_chunk >= 10) or (now - last_save_time).seconds >= 5
-                    
-                    if should_save and save_state_callback:
-                        self._log(f"Saving progress: chunk {current - 1}")
+                # 4. Resolve parent folder (Uses _path_cache optimization)
+                remote_parent = os.path.dirname(remote_path).replace('\\', '/')
+                try:
+                    parent_info = self.create_folder_recursive(remote_parent)
+                except Exception as e:
+                    if self.debug: print(f"❌ Error creating parent {remote_parent}: {e}")
+                    error_count += 1
+                    task['status'] = 'error_parent'
+                    if save_state_callback:
                         save_state_callback(batch_state)
-                        last_save_time = now
-                        last_saved_chunk = current - 1
+                    pbar.update(1)
+                    continue
                 
-                result = self.upload_file_chunked(
-                    local_path,
-                    parent_info['uuid'],
-                    file_uuid=file_uuid,
-                    upload_key=upload_key,
-                    resume_from_chunk=(last_chunk + 1) if is_resuming else 0,
-                    preserve_timestamps=preserve_timestamps,
-                    on_upload_start=on_upload_start_handler if not is_resuming else None,
-                    on_progress=on_progress_handler
-                )
+                # 5. Check conflict (Uses cache optimization)
+                # If we don't have a resume UUID, check if file exists on server
+                should_upload = True
+                if not file_uuid:
+                    name_hashed = self.crypto.hash_filename(remote_filename, self.email, self._get_master_key())
+                    
+                    # Optimization: Check local cache first before making API call
+                    # (Assumes parent_info['uuid'] cache was populated by create_folder_recursive)
+                    cached_files = self._file_cache.get(parent_info['uuid'], {}).get('data', [])
+                    exists = False
+                    
+                    if cached_files:
+                        exists = any(f['name'] == remote_filename for f in cached_files)
+                    else:
+                        # Fallback to API check if cache missing
+                        exists = self.api.check_file_exists(parent_info['uuid'], name_hashed)
+                    
+                    if exists:
+                        if on_conflict == 'skip':
+                            if self.debug: print(f"⏭️  Skipping: {remote_filename} (exists)")
+                            skipped_count += 1
+                            task['status'] = 'skipped_conflict'
+                            if save_state_callback:
+                                save_state_callback(batch_state)
+                            pbar.update(1)
+                            should_upload = False
+                        # If overwrite, we proceed (API handles replacement/versioning)
                 
-                print(f"   ✅ Upload complete")
-                print(f"   📊 SHA-512: {result['hash'][:64]}...")
-                if self.debug:
-                    print(f"   🆔 UUID: {result['uuid']}")
+                if not should_upload:
+                    continue
                 
-                success_count += 1
-                task['status'] = 'completed'
-                task['fileUuid'] = None
-                task['uploadKey'] = None
-                task['lastChunk'] = -1
-                
-            except ChunkUploadException as e:
-                print(f"\n⚠️  Upload interrupted: {e.message}")
-                task['fileUuid'] = e.file_uuid
-                task['uploadKey'] = e.upload_key
-                task['lastChunk'] = e.last_successful_chunk
-                task['status'] = 'interrupted'
-                error_count += 1
+                # 6. Perform Upload
+                try:
+                    file_size = os.path.getsize(local_path)
+                    
+                    is_resuming = (status in ['interrupted', 'uploading']) and last_chunk >= 0
+                    
+                    if self.debug:
+                        if is_resuming:
+                            print(f"📤 Resuming: {remote_filename} from chunk {last_chunk + 1} ({format_size(file_size)})")
+                        else:
+                            print(f"📤 Uploading: {remote_filename} ({format_size(file_size)})")
+                    
+                    task['status'] = 'uploading'
+                    if save_state_callback:
+                        save_state_callback(batch_state)
+                    
+                    # Track saves for callback
+                    last_save_time = datetime.now()
+                    last_saved_chunk = last_chunk
+                    
+                    def on_upload_start_handler(uuid: str, key: str):
+                        self._log(f"Upload started: uuid={uuid[:8]}..., key={key[:8]}...")
+                        task['fileUuid'] = uuid
+                        task['uploadKey'] = key
+                        task['lastChunk'] = -1
+                        if save_state_callback:
+                            save_state_callback(batch_state)
+                    
+                    def on_progress_handler(current: int, total: int, bytes_up: int, total_bytes: int):
+                        nonlocal last_save_time, last_saved_chunk
+                        task['lastChunk'] = current - 1
+                        
+                        # Save state every 5 seconds or every 10 chunks
+                        now = datetime.now()
+                        should_save = (current - last_saved_chunk >= 10) or (now - last_save_time).seconds >= 5
+                        
+                        if should_save and save_state_callback:
+                            self._log(f"Saving progress: chunk {current - 1}")
+                            save_state_callback(batch_state)
+                            last_save_time = now
+                            last_saved_chunk = current - 1
+                    
+                    result = self.upload_file_chunked(
+                        local_path,
+                        parent_info['uuid'],
+                        file_uuid=task.get('fileUuid'),
+                        upload_key=task.get('uploadKey'),
+                        resume_from_chunk=(task.get('lastChunk', -1) + 1) if is_resuming else 0,
+                        preserve_timestamps=preserve_timestamps,
+                        on_upload_start=on_upload_start_handler if not is_resuming else None,
+                        on_progress=on_progress_handler
+                    )
+                    
+                    if self.debug:
+                        print(f"   ✅ Upload complete")
+                        print(f"   📊 SHA-512: {result['hash'][:64]}...")
+                        print(f"   🆔 UUID: {result['uuid']}")
+                    
+                    success_count += 1
+                    task['status'] = 'completed'
+                    task['fileUuid'] = None
+                    task['uploadKey'] = None
+                    task['lastChunk'] = -1
+                    
+                except ChunkUploadException as e:
+                    if self.debug: print(f"\n⚠️  Upload interrupted: {e.message}")
+                    task['fileUuid'] = e.file_uuid
+                    task['uploadKey'] = e.upload_key
+                    task['lastChunk'] = e.last_successful_chunk
+                    task['status'] = 'interrupted'
+                    error_count += 1
+                    
+                    if save_state_callback:
+                        save_state_callback(batch_state)
+                    
+                    if self.debug:
+                        print("💾 Progress saved.")
+                    
+                except Exception as e:
+                    if self.debug: print(f"\n❌ Upload error: {e}")
+                    if self.debug:
+                        import traceback
+                        traceback.print_exc()
+                    error_count += 1
+                    task['status'] = 'error_upload'
                 
                 if save_state_callback:
                     save_state_callback(batch_state)
                 
-                print("💾 Progress saved:")
-                print(f"   UUID: {e.file_uuid[:16]}...")
-                print(f"   Upload Key: {e.upload_key[:16]}...")
-                print(f"   Last successful chunk: {e.last_successful_chunk}")
-                print(f"   Run again to resume from chunk {e.last_successful_chunk + 1}")
-                
-            except Exception as e:
-                print(f"\n❌ Upload error: {e}")
-                if self.debug:
-                    import traceback
-                    traceback.print_exc()
-                error_count += 1
-                task['status'] = 'error_upload'
-            
-            if save_state_callback:
-                save_state_callback(batch_state)
+                pbar.update(1)
         
         # Summary
-        print("=" * 40)
+        print("\n" + "=" * 40)
         print("📊 Upload Summary:")
         if completed_previously > 0:
             print(f"  ✅ Previous: {completed_previously}")
@@ -939,7 +993,8 @@ class DriveService:
     # ============================================================================
 
     def download_file(self, file_uuid: str, save_path: Optional[str] = None,
-                     on_progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, Any]:
+                     on_progress: Optional[Callable[[int, int], None]] = None,
+                     quiet: bool = False) -> Dict[str, Any]:
         """
         Download file from Filen
         """
@@ -971,7 +1026,8 @@ class DriveService:
             import base64
             file_key_bytes = base64.b64decode(file_key)
         
-        if not on_progress:
+        # Only print if not quiet (used by batch download to silence individual file lines)
+        if not on_progress and not quiet:
             print(f"   📄 File: {filename} ({format_size(file_size)})")
         
         # Download and decrypt chunks
@@ -1150,69 +1206,83 @@ class DriveService:
             error_count = 0
             completed_previously = 0
             
-            for i, task in enumerate(tasks):
-                remote_uuid = task['remoteUuid']
-                local_path = task['localPath']
-                status = task['status']
-                remote_mod_time = task.get('remoteModificationTime')
-                
-                if status == 'completed':
-                    completed_previously += 1
-                    continue
-                if status.startswith('skipped'):
-                    skipped_count += 1
-                    continue
-                
-                # Check conflict
-                if os.path.exists(local_path):
-                    if on_conflict == 'skip':
-                        print(f"⏭️  Skipping: {os.path.basename(local_path)} (exists)")
-                        skipped_count += 1
-                        task['status'] = 'skipped_conflict'
-                        if save_state_callback:
-                            save_state_callback(batch_state)
+            # --- MODIFIED: TQDM Progress Bar Wrapper ---
+            with tqdm(total=len(tasks), unit="file", desc="Downloading", disable=None) as pbar:
+                for i, task in enumerate(tasks):
+                    remote_uuid = task['remoteUuid']
+                    local_path = task['localPath']
+                    status = task['status']
+                    remote_mod_time = task.get('remoteModificationTime')
+                    
+                    # Update progress description
+                    filename = os.path.basename(local_path)
+                    pbar.set_description(f"Down: {filename[:20]:<20}")
+
+                    if status == 'completed':
+                        completed_previously += 1
+                        pbar.update(1)
                         continue
-                    elif on_conflict == 'newer':
-                        if remote_mod_time:
-                            local_mod_time = int(os.path.getmtime(local_path) * 1000)
-                            
-                            if remote_mod_time <= local_mod_time:
-                                print(f"⏭️  Skipping: {os.path.basename(local_path)} (local is newer)")
-                                skipped_count += 1
-                                task['status'] = 'skipped_newer'
-                                if save_state_callback:
-                                    save_state_callback(batch_state)
-                                continue
-                            print(f"📥 Downloading: {os.path.basename(local_path)} (remote is newer)")
-                
-                try:
-                    if on_conflict != 'newer':
-                        print(f"📥 Downloading: {os.path.basename(local_path)}")
+                    if status.startswith('skipped'):
+                        skipped_count += 1
+                        pbar.update(1)
+                        continue
                     
-                    result = self.download_file(remote_uuid, save_path=local_path)
+                    # Check conflict
+                    if os.path.exists(local_path):
+                        if on_conflict == 'skip':
+                            if self.debug: print(f"⏭️  Skipping: {os.path.basename(local_path)} (exists)")
+                            skipped_count += 1
+                            task['status'] = 'skipped_conflict'
+                            if save_state_callback:
+                                save_state_callback(batch_state)
+                            pbar.update(1)
+                            continue
+                        elif on_conflict == 'newer':
+                            if remote_mod_time:
+                                local_mod_time = int(os.path.getmtime(local_path) * 1000)
+                                
+                                if remote_mod_time <= local_mod_time:
+                                    if self.debug: print(f"⏭️  Skipping: {os.path.basename(local_path)} (local is newer)")
+                                    skipped_count += 1
+                                    task['status'] = 'skipped_newer'
+                                    if save_state_callback:
+                                        save_state_callback(batch_state)
+                                    pbar.update(1)
+                                    continue
+                                if self.debug: print(f"📥 Downloading: {os.path.basename(local_path)} (remote is newer)")
                     
-                    # Set timestamp
-                    mod_time = result.get('lastModified') or remote_mod_time
-                    if preserve_timestamps and mod_time:
-                        try:
-                            mod_time_sec = mod_time / 1000.0
-                            os.utime(local_path, (mod_time_sec, mod_time_sec))
-                        except Exception as e:
-                            self._log(f"Could not set timestamp: {e}")
+                    try:
+                        if self.debug:
+                            if on_conflict != 'newer':
+                                print(f"📥 Downloading: {os.path.basename(local_path)}")
+                        
+                        # Use quiet=True to avoid printing individual lines in batch
+                        result = self.download_file(remote_uuid, save_path=local_path, quiet=True)
+                        
+                        # Set timestamp
+                        mod_time = result.get('lastModified') or remote_mod_time
+                        if preserve_timestamps and mod_time:
+                            try:
+                                mod_time_sec = mod_time / 1000.0
+                                os.utime(local_path, (mod_time_sec, mod_time_sec))
+                            except Exception as e:
+                                self._log(f"Could not set timestamp: {e}")
+                        
+                        success_count += 1
+                        task['status'] = 'completed'
+                        
+                    except Exception as e:
+                        if self.debug: print(f"❌ Download error: {e}")
+                        error_count += 1
+                        task['status'] = 'error_download'
                     
-                    success_count += 1
-                    task['status'] = 'completed'
+                    if save_state_callback:
+                        save_state_callback(batch_state)
                     
-                except Exception as e:
-                    print(f"❌ Download error: {e}")
-                    error_count += 1
-                    task['status'] = 'error_download'
-                
-                if save_state_callback:
-                    save_state_callback(batch_state)
+                    pbar.update(1)
             
             # Summary
-            print("=" * 40)
+            print("\n" + "=" * 40)
             print("📊 Download Summary:")
             if completed_previously > 0:
                 print(f"  ✅ Previous: {completed_previously}")
