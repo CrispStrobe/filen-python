@@ -472,7 +472,8 @@ class DriveService:
         resume_from_chunk: int = 0,
         preserve_timestamps: bool = False,
         on_progress: Optional[Callable[[int, int, int, int], None]] = None,
-        on_upload_start: Optional[Callable[[str, str], None]] = None
+        on_upload_start: Optional[Callable[[str, str], None]] = None,
+        target_filename: Optional[str] = None  # <--- NEW PARAMETER
     ) -> Dict[str, str]:
         """
         Upload file in chunks with resume support
@@ -480,7 +481,9 @@ class DriveService:
         """
         import requests
         
-        filename = os.path.basename(file_path)
+        # Use target_filename if provided (WebDAV), otherwise use file system name (CLI)
+        filename = target_filename if target_filename else os.path.basename(file_path)
+        
         file_size = os.path.getsize(file_path)
         uuid = file_uuid or self.crypto.generate_uuid()
         master_key = self._get_master_key()
@@ -498,7 +501,7 @@ class DriveService:
             self._log("Uploading empty file via /v3/upload/empty")
             
             metadata_json = json.dumps({
-                'name': filename,
+                'name': filename, # Uses the correct name
                 'size': 0,
                 'mime': 'application/octet-stream',
                 'key': file_key_str,
@@ -591,7 +594,7 @@ class DriveService:
                     on_progress(chunk_index + 1, total_chunks, bytes_uploaded, file_size)
                 else:
                     progress = ((chunk_index + 1) / total_chunks * 100)
-                    print(f"     Uploading... {chunk_index + 1}/{total_chunks} chunks ({progress:.1f}%)  ", end='\r')
+                    # print(f"     Uploading... {chunk_index + 1}/{total_chunks} chunks ({progress:.1f}%)  ", end='\r')
                 
                 try:
                     response = requests.post(url, data=encrypted_chunk, headers=headers, timeout=30)
@@ -612,14 +615,14 @@ class DriveService:
                 
                 chunk_index += 1
         
-        print()  # Clear progress line
+        # print()  # Clear progress line
         
         # Get final hash
         total_hash = hasher.hexdigest().lower()
         
         # Finalize upload
         metadata_json = json.dumps({
-            'name': filename,
+            'name': filename, # Uses the correct variable
             'size': file_size,
             'mime': 'application/octet-stream',
             'key': file_key_str,

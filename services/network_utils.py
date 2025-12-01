@@ -306,6 +306,39 @@ class NetworkUtils:
                 'valid': False,
                 'message': f'Certificate validation failed: {e}'
             }
+        
+    @classmethod
+    def kill_process_by_port(cls, port: int) -> bool:
+        """Find and kill process listening on specific port"""
+        try:
+            if platform.system() == 'Windows':
+                # Windows: netstat -> findstr -> taskkill
+                cmd = f"netstat -ano | findstr :{port}"
+                result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+                lines = result.stdout.strip().split('\n')
+                killed_any = False
+                for line in lines:
+                    parts = line.split()
+                    if parts and 'LISTENING' in line:
+                        pid = parts[-1]
+                        cls.kill_process(int(pid), force=True)
+                        killed_any = True
+                return killed_any
+            else:
+                # Unix/MacOS: lsof
+                cmd = ["lsof", "-t", "-i", f":{port}"]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                pids = result.stdout.strip().split('\n')
+                killed_any = False
+                for pid in pids:
+                    if pid:
+                        print(f"🔪 Force killing zombie process PID {pid} on port {port}...")
+                        cls.kill_process(int(pid), force=True)
+                        killed_any = True
+                return killed_any
+        except Exception as e:
+            print(f"⚠️ Failed to kill by port: {e}")
+            return False
     
     @classmethod
     def test_webdav_connection(cls, url: str, username: str, password: str) -> Dict[str, Any]:

@@ -174,7 +174,7 @@ class FilenDAVResource(DAVNonCollection):
                 
                 # Determine parent UUID
                 path_parts = self.path.strip('/').split('/')
-                filename = path_parts[-1]
+                real_filename = path_parts[-1] # Extract the actual file name (e.g. readme.md)
                 
                 if len(path_parts) > 1:
                     parent_path = '/' + '/'.join(path_parts[:-1])
@@ -189,11 +189,12 @@ class FilenDAVResource(DAVNonCollection):
                 if existing_uuid:
                      self.drive.trash_item(existing_uuid, 'file')
                 
-                # Upload
+                # Upload with the CORRECT filename
                 self.drive.upload_file_chunked(
                     file_path=temp_path,
                     parent_uuid=parent_uuid,
-                    preserve_timestamps=True 
+                    preserve_timestamps=True,
+                    target_filename=real_filename  # <--- PASS THE NAME HERE
                 )
         except Exception as e:
             print(f"❌ WebDAV Upload Error: {e}")

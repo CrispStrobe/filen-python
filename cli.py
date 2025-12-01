@@ -1118,37 +1118,31 @@ WebDAV Examples:
         """Handle webdav-stop command"""
         print("🛑 Stopping WebDAV server...")
         
+        # 1. Try PID file
         pid = self.config.read_webdav_pid()
+        killed_via_pid = False
         
-        if not pid:
-            print("❌ Server does not appear to be running (no PID file).")
-            self.config.clear_webdav_pid()
-            return 1
-        
-        # Check if running
-        if not self.network.is_process_running(pid):
-            print(f"⚠️  Process (PID: {pid}) is not running. Cleaning up PID file.")
-            self.config.clear_webdav_pid()
-            return 0
-        
-        # Try graceful shutdown
-        success = self.network.kill_process(pid, force=False)
-        
-        if success:
-            import time
-            time.sleep(0.5)
-            
-            # Check if still running
+        if pid:
             if self.network.is_process_running(pid):
-                print("⚠️  Forcing termination...")
-                self.network.kill_process(pid, force=True)
-                time.sleep(0.2)
+                if self.network.kill_process(pid):
+                    print(f"✅ Server process (PID: {pid}) terminated.")
+                    killed_via_pid = True
+            self.config.clear_webdav_pid()
             
-            print(f"✅ Server process (PID: {pid}) terminated.")
-        else:
-            print(f"⚠️  Could not terminate process (PID: {pid}).")
+        # 2. Force cleanup by port (catch zombies)
+        # We need the port. If not passed in args, check config or default
+        # NOTE: args for webdav-stop usually doesn't have --port in your current argparse setup
+        # unless you add it. Let's assume default 8080 or read from config.
         
-        self.config.clear_webdav_pid()
+        # Read saved config to find the port
+        dav_config = self.config.read_webdav_config()
+        port = dav_config.get('port', 8080)
+        
+        if self.network.kill_process_by_port(port):
+            print(f"🧹 Cleaned up zombie process on port {port}.")
+        elif not killed_via_pid:
+             print("❌ Server does not appear to be running (no PID file or process on port).")
+
         return 0
 
     def handle_webdav_status(self, args) -> int:
