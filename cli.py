@@ -14,7 +14,7 @@ from config.config import config_service
 from services.auth import auth_service
 from services.drive import drive_service, format_size, format_date
 from services.network_utils import network_utils
-
+from services.webdav_server import webdav_server
 
 class FilenCLI:
     """Main CLI application - matches Dart FilenCLI"""
@@ -476,7 +476,6 @@ WebDAV Examples:
     def _prepare_client(self, validate_session: bool = False) -> None:
         """
         Prepare client with credentials and optionally validate session
-        Matches Internxt pattern
         """
         try:
             creds = self.auth.get_credentials()
@@ -922,11 +921,8 @@ WebDAV Examples:
                 traceback.print_exc()
             return 1
 
-    # Continue with trash, search, find, tree, webdav handlers...
-    # (They all follow the same pattern with _prepare_client())
+    # trash, search, find, tree, webdav handlers all follow the same pattern with _prepare_client()
     
-    # I'll include a few key ones below:
-
     def handle_list_trash(self, args) -> int:
         """Handle list-trash command"""
         try:
@@ -1015,8 +1011,236 @@ WebDAV Examples:
                 traceback.print_exc()
             return 1
 
-    # WebDAV handlers remain the same...
-    # (webdav_start, webdav_stop, webdav_status, webdav_test, webdav_mount, webdav_config)
+    # ============================================================================
+    # WEBDAV HANDLERS
+    # ============================================================================
+
+    def handle_mount(self, args) -> int:
+        """Handle mount command (foreground WebDAV server)"""
+        try:
+            self._prepare_client()
+            print(f"🏔️ Mounting Filen Drive via WebDAV on port {args.port}...")
+            print("   Press Ctrl+C to stop")
+            
+            # This will block until stopped
+            result = webdav_server.start(port=args.port, background=False)
+            
+            if not result['success']:
+                print(f"❌ Failed to start server: {result.get('message')}")
+                return 1
+            return 0
+            
+        except KeyboardInterrupt:
+            print("\n🛑 Stopping...")
+            return 0
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            return 1
+
+    def handle_webdav_start(self, args) -> int:
+        """Handle webdav-start command"""
+        is_daemon = args.daemon
+        background = args.background
+        port = args.port
+        
+        # --- DAEMON PROCESS (Child) ---
+        if is_daemon:
+            try:
+                # 1. Initialize credentials in this detached process
+                self._prepare_client()
+                
+                # 2. Start the server (blocks here)
+                # We use background=True mode in webdav_server which uses quiet logging
+                webdav_server.start(port=port, background=True)
+                return 0
+            except Exception:
+                return 1
+
+        # --- PARENT PROCESS (CLI) ---
+        
+        # Check for existing instance
+        existing_pid = self.config.read_webdav_pid()
+        if existing_pid:
+            is_running = self.network.is_process_running(existing_pid)
+            if is_running:
+                print(f"❌ WebDAV server is already running (PID: {existing_pid}).")
+                print("💡 Run \"filen webdav-stop\" to stop it first.")
+                return 1
+            else:
+                # Stale PID file
+                self.config.clear_webdav_pid()
+        
+        if background:
+            print("🚀 Starting WebDAV server in background...")
+            
+            try:
+                # Start daemon process
+                import subprocess
+                
+                # Launch self with --daemon flag
+                process = subprocess.Popen(
+                    [sys.executable, __file__, 'webdav-start', '--daemon', f'--port={port}'],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True
+                )
+                
+                # Give it time to start
+                import time
+                time.sleep(1)
+                
+                # Verify running
+                if not self.network.is_process_running(process.pid):
+                    print("❌ Failed to start background process")
+                    self.config.clear_webdav_pid()
+                    return 1
+                
+                self.config.save_webdav_pid(process.pid)
+                
+                print(f"✅ WebDAV server started in background (PID: {process.pid})")
+                print(f"   URL: http://localhost:{port}/")
+                print("   User: filen")
+                print("   Pass: filen-webdav")
+                print("\n💡 Use \"filen webdav-test\" to verify connection")
+                print("💡 Use \"filen webdav-stop\" to stop")
+                
+                return 0
+            
+            except Exception as e:
+                print(f"❌ Failed to start background process: {e}")
+                self.config.clear_webdav_pid()
+                return 1
+        
+        # If not background and not daemon, run in foreground (same as mount)
+        return self.handle_mount(args)
+
+    def handle_webdav_stop(self, args) -> int:
+        """Handle webdav-stop command"""
+        print("🛑 Stopping WebDAV server...")
+        
+        pid = self.config.read_webdav_pid()
+        
+        if not pid:
+            print("❌ Server does not appear to be running (no PID file).")
+            self.config.clear_webdav_pid()
+            return 1
+        
+        # Check if running
+        if not self.network.is_process_running(pid):
+            print(f"⚠️  Process (PID: {pid}) is not running. Cleaning up PID file.")
+            self.config.clear_webdav_pid()
+            return 0
+        
+        # Try graceful shutdown
+        success = self.network.kill_process(pid, force=False)
+        
+        if success:
+            import time
+            time.sleep(0.5)
+            
+            # Check if still running
+            if self.network.is_process_running(pid):
+                print("⚠️  Forcing termination...")
+                self.network.kill_process(pid, force=True)
+                time.sleep(0.2)
+            
+            print(f"✅ Server process (PID: {pid}) terminated.")
+        else:
+            print(f"⚠️  Could not terminate process (PID: {pid}).")
+        
+        self.config.clear_webdav_pid()
+        return 0
+
+    def handle_webdav_status(self, args) -> int:
+        """Handle webdav-status command"""
+        pid = self.config.read_webdav_pid()
+        port = args.port
+        
+        if not pid:
+            print("❌ WebDAV server is not running (no PID file).")
+            print("💡 Start with: filen webdav-start --background")
+            return 1
+        
+        # Check if running
+        if not self.network.is_process_running(pid):
+            print("❌ WebDAV server PID file exists but process is not running.")
+            print(f"   Stale PID: {pid}")
+            print("💡 Run \"filen webdav-stop\" to clean up.")
+            return 1
+        
+        print("✅ WebDAV server is running in background.")
+        print(f"   PID: {pid}")
+        print(f"   URL: http://localhost:{port}/")
+        print("   User: filen")
+        print("   Pass: filen-webdav")
+        print("\n💡 Use \"filen webdav-test\" to verify connection.")
+        print("💡 Use \"filen webdav-stop\" to stop it.")
+        
+        return 0
+
+    def handle_webdav_test(self, args) -> int:
+        """Handle webdav-test command"""
+        port = args.port
+        url = f"http://localhost:{port}/"
+        
+        print(f"🧪 Testing WebDAV server connection at {url} ...")
+        
+        result = self.network.test_webdav_connection(url, 'filen', 'filen-webdav')
+        
+        if result['success']:
+            print(f"✅ {result['message']}")
+            print("   Server is running and authentication is working.")
+        else:
+            print(f"❌ {result['message']}")
+        
+        return 0 if result['success'] else 1
+
+    def handle_webdav_mount(self, args) -> int:
+        """Handle webdav-mount command"""
+        port = args.port
+        url = f"http://localhost:{port}/"
+        
+        print("🗂️  Mount Instructions for Filen Drive")
+        print("=" * 50)
+        print(f"Server URL: {url}")
+        print("Username:   filen")
+        print("Password:   filen-webdav")
+        
+        print("\n--- macOS ---")
+        print("1. Open Finder")
+        print("2. Press Cmd+K (Go > Connect to Server)")
+        print(f"3. Enter: {url}")
+        print("4. Connect, then enter username and password.")
+        
+        print("\n--- Windows ---")
+        print("1. Open File Explorer")
+        print("2. Right-click \"This PC\" > \"Map network drive...\"")
+        print(f"3. Enter: {url}")
+        print("4. Check \"Connect using different credentials\"")
+        print("5. Connect, then enter username and password.")
+        
+        print("\n--- Linux (davfs2) ---")
+        print("sudo apt install davfs2")
+        print("sudo mkdir -p /mnt/filen")
+        print(f"sudo mount -t davfs {url} /mnt/filen")
+        print("(You will be prompted for username and password)")
+        
+        return 0
+
+    def handle_webdav_config(self, args) -> int:
+        """Handle webdav-config command"""
+        port = args.port
+        
+        print("⚙️  WebDAV Server Configuration")
+        print("=" * 40)
+        print("   Host: localhost")
+        print(f"   Port: {port}")
+        print("   User: filen")
+        print("   Pass: filen-webdav")
+        print("   Protocol: http (SSL not implemented in this version)")
+        print(f"   Background PID File: {self.config.webdav_pid_file}")
+        
+        return 0
     
     def handle_config(self) -> int:
         """Handle config command"""
@@ -1050,11 +1274,137 @@ WebDAV Examples:
         
         return 0
 
-    # Add remaining handlers (restore-uuid, restore-path, resolve, search, find, webdav commands)
-    # All follow same pattern with _prepare_client()...
-    # (I can add them all if you want, but they're identical to previous version just with _prepare_client() call)
+    def handle_restore_uuid(self, args) -> int:
+        """Restore item from trash by UUID"""
+        try:
+            self._prepare_client()
+            
+            # We need to know if it's a file or folder to call the right API
+            print("🔍 Searching trash...")
+            trash = self.drive.get_trash_content()
+            
+            item = next((i for i in trash if i['uuid'] == args.uuid), None)
+            
+            if not item:
+                print(f"❌ Item {args.uuid} not found in trash")
+                return 1
+                
+            print(f"♻️  Restoring {item['type']} \"{item['name']}\"...")
+            self.drive.restore_item(item['uuid'], item['type'])
+            print("✅ Restore successful")
+            return 0
+            
+        except Exception as e:
+            print(f"❌ Restore failed: {e}")
+            return 1
 
+    def handle_restore_path(self, args) -> int:
+        """Restore item from trash by Name"""
+        try:
+            self._prepare_client()
+            
+            print("🔍 Searching trash...")
+            trash = self.drive.get_trash_content()
+            
+            # Find items matching the name
+            matches = [i for i in trash if i['name'] == args.name]
+            
+            if not matches:
+                print(f"❌ No item named \"{args.name}\" found in trash")
+                return 1
+            
+            if len(matches) > 1:
+                print(f"⚠️  Multiple items found named \"{args.name}\":")
+                for i in matches:
+                    print(f"   - {i['type'].ljust(6)} {i['uuid']} (Size: {format_size(i.get('size', 0))})")
+                print("💡 Use 'restore-uuid' with the specific UUID")
+                return 1
+            
+            item = matches[0]
+            print(f"♻️  Restoring {item['type']} \"{item['name']}\"...")
+            self.drive.restore_item(item['uuid'], item['type'])
+            print("✅ Restore successful")
+            return 0
+            
+        except Exception as e:
+            print(f"❌ Restore failed: {e}")
+            return 1
 
+    def handle_resolve(self, args) -> int:
+        """Debug command to resolve a path"""
+        try:
+            self._prepare_client()
+            print(f"🔍 Resolving: {args.path}")
+            
+            result = self.drive.resolve_path(args.path)
+            
+            print("\n✅ Found:")
+            print(f"   Name: {result['metadata'].get('name')}")
+            print(f"   Type: {result['type']}")
+            print(f"   UUID: {result['uuid']}")
+            if 'parent' in result:
+                print(f"   Parent: {result['parent']}")
+            return 0
+            
+        except FileNotFoundError:
+            print("❌ Path not found")
+            return 1
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            return 1
+
+    def handle_find(self, args) -> int:
+        """Handle find command"""
+        try:
+            self._prepare_client()
+            
+            print(f"🔍 Finding \"{args.pattern}\" in \"{args.path}\"...")
+            
+            results = self.drive.find_files(
+                args.path, 
+                args.pattern, 
+                max_depth=args.maxdepth
+            )
+            
+            if not results:
+                print("   No matches found")
+                return 0
+                
+            print(f"\nFound {len(results)} matches:")
+            for item in results:
+                print(f"   {item['fullPath']}")
+                
+            return 0
+            
+        except Exception as e:
+            print(f"❌ Find failed: {e}")
+            return 1
+
+    def handle_search(self, args) -> int:
+        """Handle search command (Global find)"""
+        try:
+            self._prepare_client()
+            
+            # Map search to a global recursive find
+            print(f"🔍 Searching for \"*{args.query}*\"...")
+            
+            results = self.drive.find_files('/', f'*{args.query}*')
+            
+            if not results:
+                print("   No matches found")
+                return 0
+                
+            print(f"\nFound {len(results)} matches:")
+            for item in results:
+                uuid_str = f" ({item['uuid']})" if args.uuids else ""
+                print(f"   {item['fullPath']}{uuid_str}")
+                
+            return 0
+            
+        except Exception as e:
+            print(f"❌ Search failed: {e}")
+            return 1
+        
 def main():
     """Main entry point"""
     cli = FilenCLI()

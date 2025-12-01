@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 filen_cli/services/drive.py
-File operations for Filen - COMPLETE VERSION with batching, resume, search, etc.
+File operations for Filen with batching, resume, search, etc.
 """
 
 import os
@@ -9,7 +9,7 @@ import json
 import hashlib
 import glob as glob_module
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Callable, Tuple
+from typing import Dict, Any, List, Optional, Callable, Tuple, Iterator
 from datetime import datetime
 
 from config.config import config_service
@@ -81,6 +81,74 @@ class DriveService:
             except:
                 continue
         raise Exception("Failed to decrypt with any master key")
+    
+    def download_file_generator(self, file_uuid: str, offset: int = 0, length: Optional[int] = None) -> Iterator[bytes]:
+        """
+        Yields decrypted file bytes for streaming (WebDAV support).
+        """
+        import requests
+        
+        # Get metadata and decrypt
+        metadata = self.api.get_file_metadata(file_uuid)
+        encrypted_metadata = metadata.get('metadata')
+        decrypted_str = self._try_decrypt(encrypted_metadata)
+        meta = json.loads(decrypted_str)
+        
+        file_key = meta.get('key', '')
+        chunks = int(metadata.get('chunks', 0))
+        region = metadata.get('region')
+        bucket = metadata.get('bucket')
+        total_size = int(meta.get('size', 0))
+
+        # Decode file key
+        if len(file_key) == 32:
+            file_key_bytes = file_key.encode('utf-8')
+        else:
+            import base64
+            file_key_bytes = base64.b64decode(file_key)
+
+        # Calculate start/end chunks based on offset (Simplification: assumes 1MB chunks)
+        # Note: Precision seeking in encrypted GCM streams is hard without overhead. 
+        # We will stream from the specific chunk containing the offset.
+        CHUNK_SIZE = 1048576 # 1MB standard Filen chunk
+        
+        start_chunk = offset // CHUNK_SIZE
+        bytes_to_skip_in_first_chunk = offset % CHUNK_SIZE
+        
+        bytes_yielded = 0
+        limit = length if length is not None else (total_size - offset)
+
+        for i in range(start_chunk, chunks):
+            if bytes_yielded >= limit:
+                break
+
+            url = f"{self.config.egest_url}/{region}/{bucket}/{file_uuid}/{i}"
+            response = requests.get(url, stream=True, timeout=30)
+            
+            if response.status_code != 200:
+                raise Exception(f"Chunk download failed: {response.status_code}")
+            
+            # Read full chunk and decrypt (GCM requires full block for tag verification)
+            encrypted_data = response.content
+            try:
+                decrypted_chunk = self.crypto.decrypt_data(encrypted_data, file_key_bytes)
+            except Exception as e:
+                print(f"Decryption error on chunk {i}: {e}")
+                break
+
+            # Handle offset logic
+            if i == start_chunk:
+                data_slice = decrypted_chunk[bytes_to_skip_in_first_chunk:]
+            else:
+                data_slice = decrypted_chunk
+
+            # Handle length limit
+            if bytes_yielded + len(data_slice) > limit:
+                data_slice = data_slice[:limit - bytes_yielded]
+
+            if data_slice:
+                yield data_slice
+                bytes_yielded += len(data_slice)
 
     # ============================================================================
     # LIST OPERATIONS WITH CACHING
@@ -1512,3 +1580,4 @@ def format_date(timestamp: int) -> str:
         return dt.strftime('%Y-%m-%d')
     except:
         return ''
+
