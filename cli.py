@@ -107,33 +107,25 @@ WebDAV Examples:
         download_parser.add_argument('--on-conflict', choices=['skip', 'overwrite', 'newer'],
                                    default='skip', help='Action if target exists')
         
-        # Download path (recursive)
-        download_path_parser = subparsers.add_parser('download-path', 
-                                                     help='Download by path (recursive)')
-        download_path_parser.add_argument('path', help='Remote path')
-        download_path_parser.add_argument('-t', '--target', help='Local destination')
-        download_path_parser.add_argument('-r', '--recursive', action='store_true',
-                                        help='Recursive download')
-        download_path_parser.add_argument('-p', '--preserve-timestamps', action='store_true',
-                                        help='Preserve modification times')
-        download_path_parser.add_argument('--on-conflict', choices=['skip', 'overwrite', 'newer'],
-                                        default='skip', help='Action if target exists')
-        download_path_parser.add_argument('--include', action='append',
-                                        help='Include file pattern')
-        download_path_parser.add_argument('--exclude', action='append',
-                                        help='Exclude file pattern')
+        # Download Path - Now accepts "download-path /remote/path /local/dest"
+        download_path_parser = subparsers.add_parser('download-path', help='Download by path')
+        download_path_parser.add_argument('paths', nargs='+', help='Remote path(s) [and local destination]')
+        download_path_parser.add_argument('-t', '--target', help='Local destination (optional override)')
+        download_path_parser.add_argument('-r', '--recursive', action='store_true', help='Recursive download')
+        download_path_parser.add_argument('-p', '--preserve-timestamps', action='store_true', help='Preserve timestamps')
+        download_path_parser.add_argument('--on-conflict', choices=['skip', 'overwrite', 'newer'], default='skip', help='Conflict action')
+        download_path_parser.add_argument('--include', action='append', help='Include pattern')
+        download_path_parser.add_argument('--exclude', action='append', help='Exclude pattern')
         
-        # Move (mv)
+        # Move (mv) - Now accepts "mv src1 src2 dest"
         move_parser = subparsers.add_parser('mv', help='Move file/folder')
-        move_parser.add_argument('source', help='Source path or pattern')
-        move_parser.add_argument('dest', help='Destination path')
+        move_parser.add_argument('paths', nargs='+', help='Source path(s) and Destination')
         move_parser.add_argument('--include', action='append', help='Include file pattern')
         move_parser.add_argument('--exclude', action='append', help='Exclude file pattern')
-        
-        # Copy (cp)
+
+        # Copy (cp) - Now accepts "cp src1 src2 dest"
         copy_parser = subparsers.add_parser('cp', help='Copy file')
-        copy_parser.add_argument('source', help='Source path or pattern')
-        copy_parser.add_argument('dest', help='Destination path')
+        copy_parser.add_argument('paths', nargs='+', help='Source path(s) and Destination')
         copy_parser.add_argument('--include', action='append', help='Include file pattern')
         copy_parser.add_argument('--exclude', action='append', help='Exclude file pattern')
         
@@ -828,59 +820,76 @@ WebDAV Examples:
             return 1
 
     def handle_download_path(self, args) -> int:
-        """Handle download-path command with wildcards"""
+        """Handle download-path with optional positional destination"""
         try:
-            # Validate session
             self._prepare_client(validate_session=True)
             
-            # 1. Expand Sources
-            items = self._expand_remote_path(args.path)
+            # PARSING LOGIC:
+            remote_patterns = args.paths
+            local_target = args.target
+
+            # Heuristic: If target flag NOT set, check if last arg looks like a local path
+            if not local_target:
+                if len(args.paths) > 1:
+                    # Assume last arg is local destination
+                    local_target = args.paths[-1]
+                    remote_patterns = args.paths[:-1]
+                else:
+                    # Only one arg provided, default to current dir
+                    local_target = '.'
             
-            # 2. Filter
+            # 1. Expand Remote Sources
+            items_to_process = []
             include = getattr(args, 'include', []) or []
             exclude = getattr(args, 'exclude', []) or []
-            
-            items_to_process = [i for i in items if self._should_process_item(i['name'], include, exclude)]
-            
+
+            for pattern in remote_patterns:
+                expanded = self._expand_remote_path(pattern)
+                filtered = [i for i in expanded if self._should_process_item(i['name'], include, exclude)]
+                items_to_process.extend(filtered)
+
             if not items_to_process:
-                print(f"❌ No items found matching '{args.path}'")
+                print(f"❌ No items found matching: {remote_patterns}")
                 return 1
 
-            # Determine Target Directory
-            target_dir = args.target or '.'
-            if len(items_to_process) > 1 and not os.path.isdir(target_dir):
-                os.makedirs(target_dir, exist_ok=True)
+            # 2. Prepare Destination
+            if len(items_to_process) > 1 and not os.path.isdir(local_target):
+                # If downloading multiple, force target to be a directory
+                os.makedirs(local_target, exist_ok=True)
 
-            print(f"📥 Downloading {len(items_to_process)} items to '{target_dir}'...")
+            print(f"📥 Downloading {len(items_to_process)} items to '{local_target}'...")
 
             # 3. Execute Batch
-            # We reuse the existing batch logic by creating a task list manually
-            # or simply calling the drive service for each if simple
-            
-            # Use batch ID
-            batch_id = self.config.generate_batch_id('download', [i['path'] for i in items_to_process], target_dir)
+            # Generate batch ID for resume capability
+            batch_id = self.config.generate_batch_id('download', [i['path'] for i in items_to_process], local_target)
             batch_state = self.config.load_batch_state(batch_id)
 
             success = 0
             for item in items_to_process:
                 try:
-                    # If it's a folder, we use the recursive download logic
+                    # Recursive download for folders
                     if item['type'] == 'folder':
                         self.drive.download_path(
                             item['path'],
-                            local_destination=target_dir,
+                            local_destination=local_target,
                             recursive=args.recursive,
                             on_conflict=args.on_conflict,
                             preserve_timestamps=args.preserve_timestamps,
-                            include=include, # Pass filters down
+                            include=include,
                             exclude=exclude
                         )
                         success += 1
                     else:
-                        # Single file
+                        # Single file download
+                        # If target is dir, join path. If file, use as is (only if 1 item)
+                        if os.path.isdir(local_target):
+                            save_path = os.path.join(local_target, item['name'])
+                        else:
+                            save_path = local_target
+
                         self.drive.download_file(
                             item['uuid'],
-                            save_path=os.path.join(target_dir, item['name']),
+                            save_path=save_path,
                             preserve_timestamps=args.preserve_timestamps
                         )
                         success += 1
@@ -889,6 +898,10 @@ WebDAV Examples:
                 except Exception as e:
                     print(f"  ❌ Error downloading {item['name']}: {e}")
 
+            # Cleanup
+            if success == len(items_to_process):
+                self.config.delete_batch_state(batch_id)
+
             return 0
             
         except Exception as e:
@@ -896,63 +909,95 @@ WebDAV Examples:
             return 1
 
     def handle_move(self, args) -> int:
-        """Handle move command with wildcards"""
+        """Handle move command with multi-source support"""
         return self._handle_transfer('move', args)
 
     def handle_copy(self, args) -> int:
-        """Handle copy command with wildcards"""
+        """Handle copy command with multi-source support"""
         return self._handle_transfer('copy', args)
 
     def _handle_transfer(self, mode: str, args) -> int:
-        """Shared logic for mv/cp"""
+        """Shared logic for mv/cp with 'last arg is destination' logic"""
         try:
             self._prepare_client()
             
-            # 1. Expand Source(s)
-            sources = self._expand_remote_path(args.source)
-            
-            # 2. Filter Sources
-            include = getattr(args, 'include', []) or []
-            exclude = getattr(args, 'exclude', []) or []
-            
-            items_to_process = [i for i in sources if self._should_process_item(i['name'], include, exclude)]
-            
-            if not items_to_process:
-                print(f"❌ No items found matching '{args.source}'")
+            # PARSING LOGIC:
+            if len(args.paths) < 2:
+                print(f"❌ Error: {mode} requires at least a source and a destination.")
                 return 1
             
-            # 3. Resolve Destination
-            # If we have multiple sources, dest MUST be a folder
+            # Last argument is ALWAYS destination
+            dest_path_raw = args.paths[-1]
+            source_patterns = args.paths[:-1]
+            
+            # 1. Expand all Source Patterns
+            all_items_to_process = []
+            include = getattr(args, 'include', []) or []
+            exclude = getattr(args, 'exclude', []) or []
+
+            for pattern in source_patterns:
+                expanded = self._expand_remote_path(pattern)
+                # Filter
+                filtered = [i for i in expanded if self._should_process_item(i['name'], include, exclude)]
+                all_items_to_process.extend(filtered)
+            
+            if not all_items_to_process:
+                print(f"❌ No items found matching sources: {source_patterns}")
+                return 1
+            
+            # 2. Resolve Destination
+            # If multiple items, destination MUST be a folder
             try:
-                dest = self.drive.resolve_path(args.dest)
-                if len(items_to_process) > 1 and dest['type'] != 'folder':
-                     print(f"❌ Destination '{args.dest}' must be a folder when processing multiple items.")
+                dest = self.drive.resolve_path(dest_path_raw)
+                
+                if len(all_items_to_process) > 1 and dest['type'] != 'folder':
+                     print(f"❌ Destination '{dest_path_raw}' must be a folder when processing multiple items.")
                      return 1
+                     
+                dest_uuid = dest['uuid']
+                
             except FileNotFoundError:
-                # If moving multiple items, create dest as folder
-                if len(items_to_process) > 1 or args.dest.endswith('/'):
-                    print(f"📂 Creating destination folder '{args.dest}'...")
-                    dest = self.drive.create_folder_recursive(args.dest)
+                # If destination doesn't exist...
+                if len(all_items_to_process) > 1 or dest_path_raw.endswith('/'):
+                    # We are moving multiple things, so we create the folder
+                    print(f"📂 Creating destination folder '{dest_path_raw}'...")
+                    dest = self.drive.create_folder_recursive(dest_path_raw)
+                    dest_uuid = dest['uuid']
                 else:
-                    # Single item rename/move scenario logic handled inside drive service usually,
-                    # but here we'll enforce folder structure for safety with wildcards
-                     print(f"❌ Destination '{args.dest}' not found.")
-                     return 1
+                    # Single item rename/move scenario
+                    # We need the PARENT of the non-existent destination
+                    parent_path = os.path.dirname(dest_path_raw)
+                    if not parent_path: parent_path = '/'
+                    
+                    try:
+                        parent_dest = self.drive.resolve_path(parent_path)
+                        dest_uuid = parent_dest['uuid']
+                        # For single file rename/move, we might handle it differently, 
+                        # but standard API move is UUID->UUID. 
+                        # If the user wants to RENAME, they should use 'rename' command or we implement implicit rename here.
+                        # For simplicity in this logic, we assume standard folder-to-folder move.
+                        if mode == 'move':
+                            print(f"ℹ️  To rename a file, use the 'rename' command.")
+                            print(f"❌ Destination folder '{dest_path_raw}' not found.")
+                            return 1
+                        else:
+                            print(f"❌ Destination folder '{dest_path_raw}' not found.")
+                            return 1
+                    except FileNotFoundError:
+                        print(f"❌ Destination path '{dest_path_raw}' invalid.")
+                        return 1
 
-            dest_uuid = dest['uuid']
-
-            # 4. Execute
+            # 3. Execute
             success_count = 0
             action_name = "Moving" if mode == 'move' else "Copying"
             
-            print(f"📦 {action_name} {len(items_to_process)} items to '{args.dest}'...")
+            print(f"📦 {action_name} {len(all_items_to_process)} items to '{dest_path_raw}'...")
             
-            for item in items_to_process:
+            for item in all_items_to_process:
                 try:
                     if mode == 'move':
                         self.drive.move_item(item['uuid'], dest_uuid, item['type'])
                     else:
-                        # Copy
                         if item['type'] == 'folder':
                             print(f"⚠️  Skipping folder '{item['name']}' (Folder copy not supported)")
                             continue
@@ -963,7 +1008,7 @@ WebDAV Examples:
                 except Exception as e:
                     print(f"  ❌ Error processing {item['name']}: {e}")
 
-            print(f"✅ {action_name} completed. ({success_count}/{len(items_to_process)} successful)")
+            print(f"✅ {action_name} completed. ({success_count}/{len(all_items_to_process)} successful)")
             return 0
             
         except Exception as e:
