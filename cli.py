@@ -72,13 +72,13 @@ WebDAV Examples:
         # File Operations
         # ========================================================================
         
-        # List
+        # List (ls)
         ls_parser = subparsers.add_parser('ls', help='List folder contents')
-        ls_parser.add_argument('path', nargs='?', default='/', help='Folder path')
-        ls_parser.add_argument('-d', '--detailed', action='store_true',
-                             help='Show detailed information')
-        ls_parser.add_argument('--uuids', action='store_true',
-                             help='Show full UUIDs')
+        ls_parser.add_argument('path', nargs='?', default='/', help='Folder path or pattern')
+        ls_parser.add_argument('-d', '--detailed', action='store_true', help='Show detailed information')
+        ls_parser.add_argument('--uuids', action='store_true', help='Show full UUIDs')
+        ls_parser.add_argument('--include', action='append', help='Include file pattern')
+        ls_parser.add_argument('--exclude', action='append', help='Exclude file pattern')
         
         # Make directory
         mkdir_parser = subparsers.add_parser('mkdir', help='Create folder(s)')
@@ -123,15 +123,19 @@ WebDAV Examples:
         download_path_parser.add_argument('--exclude', action='append',
                                         help='Exclude file pattern')
         
-        # Move
+        # Move (mv)
         move_parser = subparsers.add_parser('mv', help='Move file/folder')
-        move_parser.add_argument('source', help='Source path')
+        move_parser.add_argument('source', help='Source path or pattern')
         move_parser.add_argument('dest', help='Destination path')
+        move_parser.add_argument('--include', action='append', help='Include file pattern')
+        move_parser.add_argument('--exclude', action='append', help='Exclude file pattern')
         
-        # Copy
+        # Copy (cp)
         copy_parser = subparsers.add_parser('cp', help='Copy file')
-        copy_parser.add_argument('source', help='Source path')
+        copy_parser.add_argument('source', help='Source path or pattern')
         copy_parser.add_argument('dest', help='Destination path')
+        copy_parser.add_argument('--include', action='append', help='Include file pattern')
+        copy_parser.add_argument('--exclude', action='append', help='Exclude file pattern')
         
         # Rename
         rename_parser = subparsers.add_parser('rename', help='Rename item')
@@ -156,10 +160,11 @@ WebDAV Examples:
         verify_parser.add_argument('remote', help='File UUID or path')
         verify_parser.add_argument('local', help='Local file path')
         
-        # List trash
+        # List Trash
         list_trash_parser = subparsers.add_parser('list-trash', help='Show trash contents')
-        list_trash_parser.add_argument('--uuids', action='store_true',
-                                      help='Show full UUIDs')
+        list_trash_parser.add_argument('--uuids', action='store_true', help='Show full UUIDs')
+        list_trash_parser.add_argument('--include', action='append', help='Include file pattern')
+        list_trash_parser.add_argument('--exclude', action='append', help='Exclude file pattern')
         
         # Restore by UUID
         restore_uuid_parser = subparsers.add_parser('restore-uuid', 
@@ -178,15 +183,17 @@ WebDAV Examples:
         # Search
         search_parser = subparsers.add_parser('search', help='Server-side search')
         search_parser.add_argument('query', help='Search query')
-        search_parser.add_argument('--uuids', action='store_true',
-                                  help='Show full UUIDs')
+        search_parser.add_argument('--uuids', action='store_true', help='Show full UUIDs')
+        search_parser.add_argument('--include', action='append', help='Include file pattern')
+        search_parser.add_argument('--exclude', action='append', help='Exclude file pattern')
         
-        # Find
+        # Find (Update to include filters)
         find_parser = subparsers.add_parser('find', help='Recursive file find')
         find_parser.add_argument('path', help='Starting path')
         find_parser.add_argument('pattern', help='File pattern (e.g., "*.pdf")')
-        find_parser.add_argument('--maxdepth', type=int, default=-1,
-                               help='Limit depth (-1 for infinite)')
+        find_parser.add_argument('--maxdepth', type=int, default=-1, help='Limit depth (-1 for infinite)')
+        find_parser.add_argument('--include', action='append', help='Additional include pattern')
+        find_parser.add_argument('--exclude', action='append', help='Exclude file pattern')
         
         # Tree
         tree_parser = subparsers.add_parser('tree', help='Show folder tree')
@@ -581,89 +588,125 @@ WebDAV Examples:
     # ============================================================================
 
     def handle_list(self, args) -> int:
-        """Handle list command"""
+        """Handle list command with wildcards and filtering"""
         try:
             self._prepare_client()
             
-            resolved = self.drive.resolve_path(args.path)
+            # 1. Expand path/pattern
+            # If args.path looks like a glob (contains *?[), expand it
+            # Otherwise treat as a folder list unless it's a file
+            import fnmatch
+            path_arg = args.path
             
-            if resolved['type'] == 'file':
-                print(f"📄 File: {resolved['metadata']['name']} ({resolved['uuid']})")
+            is_pattern = any(char in path_arg for char in ['*', '?', '['])
+            
+            # Get filters
+            include = getattr(args, 'include', []) or []
+            exclude = getattr(args, 'exclude', []) or []
+            
+            if is_pattern:
+                # Case A: "ls *.txt" -> List matches
+                items = self._expand_remote_path(path_arg)
+                # Apply filters
+                filtered = [i for i in items if self._should_process_item(i['name'], include, exclude)]
+                
+                if not filtered:
+                    print(f"📭 No items found matching '{path_arg}'")
+                    return 0
+                    
+                print(f"🔍 Found {len(filtered)} items matching '{path_arg}':\n")
+                self._print_item_list(filtered, args.detailed, args.uuids)
                 return 0
-            
-            uuid = resolved['uuid']
-            show_full_uuids = args.uuids or args.detailed
-            
-            print(f"📂 {resolved['path']} (UUID: {uuid[:8]}...)\n")
-            
-            folders = self.drive.list_folders(uuid, detailed=args.detailed)
-            files = self.drive.list_files(uuid, detailed=args.detailed)
-            items = folders + files
-            
-            if not items:
-                print("   (empty)")
-                return 0
-            
-            # Build table
-            name_width = 40
-            size_width = 12
-            date_width = 10
-            uuid_width = 36 if show_full_uuids else 11
-            
-            if args.detailed:
-                top = f"╔{'═' * 9}{'═' * name_width}{'═' * (size_width + 2)}{'═' * (date_width + 2)}{'═' * (uuid_width + 2)}╗"
-                header = f"║  Type    {'Name'.ljust(name_width)}  {'Size'.rjust(size_width)}  {'Modified'.rjust(date_width)}  {'UUID'.ljust(uuid_width)} ║"
-                sep = f"╠{'═' * 9}{'═' * name_width}{'═' * (size_width + 2)}{'═' * (date_width + 2)}{'═' * (uuid_width + 2)}╣"
-                footer = f"╚{'═' * 9}{'═' * name_width}{'═' * (size_width + 2)}{'═' * (date_width + 2)}{'═' * (uuid_width + 2)}╝"
             else:
-                top = f"╔{'═' * 9}{'═' * name_width}{'═' * (size_width + 2)}{'═' * (uuid_width + 2)}╗"
-                header = f"║  Type    {'Name'.ljust(name_width)}  {'Size'.rjust(size_width)}  {'UUID'.ljust(uuid_width)} ║"
-                sep = f"╠{'═' * 9}{'═' * name_width}{'═' * (size_width + 2)}{'═' * (uuid_width + 2)}╣"
-                footer = f"╚{'═' * 9}{'═' * name_width}{'═' * (size_width + 2)}{'═' * (uuid_width + 2)}╝"
-            
-            print(top)
-            print(header)
-            print(sep)
-            
-            folder_count = 0
-            file_count = 0
-            
-            for item in items:
-                icon = '📁' if item['type'] == 'folder' else '📄'
-                if item['type'] == 'folder':
-                    folder_count += 1
-                else:
-                    file_count += 1
+                # Case B: Standard folder list "ls /Docs"
+                # Resolve strictly first
+                resolved = self.drive.resolve_path(path_arg)
                 
-                name = item['name']
-                if len(name) > name_width:
-                    name = name[:name_width - 3] + '...'
-                name = name.ljust(name_width)
+                if resolved['type'] == 'file':
+                    # Check filters for single file
+                    if not self._should_process_item(resolved['metadata']['name'], include, exclude):
+                        print("🚫 File filtered out")
+                        return 0
+                    print(f"📄 File: {resolved['metadata']['name']} ({resolved['uuid']})")
+                    return 0
                 
-                size = '<DIR>' if item['type'] == 'folder' else format_size(item.get('size', 0))
-                size = size.rjust(size_width)
+                # It's a folder, list contents
+                uuid = resolved['uuid']
+                print(f"📂 {resolved['path']} (UUID: {uuid[:8]}...)\n")
                 
-                item_uuid = item.get('uuid', 'N/A')
-                uuid_display = (item_uuid if show_full_uuids else f"{item_uuid[:8]}...").ljust(uuid_width)
+                folders = self.drive.list_folders(uuid, detailed=args.detailed)
+                files = self.drive.list_files(uuid, detailed=args.detailed)
+                all_items = folders + files
                 
-                if args.detailed:
-                    modified = item.get('lastModified', item.get('timestamp', 0))
-                    date_display = format_date(modified).rjust(date_width)
-                    print(f"║  {icon}  {name}  {size}  {date_display}  {uuid_display} ║")
-                else:
-                    print(f"║  {icon}  {name}  {size}  {uuid_display} ║")
-            
-            print(footer)
-            print(f"\n📊 Total: {len(items)} items ({folder_count} folders, {file_count} files)")
-            
-            return 0
-        
+                # Filter contents
+                filtered = [i for i in all_items if self._should_process_item(i['name'], include, exclude)]
+                
+                if not filtered:
+                    print("   (empty or all items filtered)")
+                    return 0
+                
+                self._print_item_list(filtered, args.detailed, args.uuids)
+                return 0
+
         except Exception as e:
             print(f"❌ List failed: {e}")
             if self.debug:
                 import traceback
                 traceback.print_exc()
             return 1
+
+    def _print_item_list(self, items, detailed, show_uuids):
+        """Helper to print table of items"""
+        name_width = 40
+        size_width = 12
+        date_width = 16
+        uuid_width = 36 if show_uuids else 11
+        
+        if detailed:
+            top = f"╔{'═' * 9}{'═' * name_width}{'═' * (size_width + 2)}{'═' * (date_width + 2)}{'═' * (uuid_width + 2)}╗"
+            header = f"║  Type    {'Name'.ljust(name_width)}  {'Size'.rjust(size_width)}  {'Modified'.rjust(date_width)}  {'UUID'.ljust(uuid_width)} ║"
+            sep = f"╠{'═' * 9}{'═' * name_width}{'═' * (size_width + 2)}{'═' * (date_width + 2)}{'═' * (uuid_width + 2)}╣"
+            footer = f"╚{'═' * 9}{'═' * name_width}{'═' * (size_width + 2)}{'═' * (date_width + 2)}{'═' * (uuid_width + 2)}╝"
+        else:
+            top = f"╔{'═' * 9}{'═' * name_width}{'═' * (size_width + 2)}{'═' * (uuid_width + 2)}╗"
+            header = f"║  Type    {'Name'.ljust(name_width)}  {'Size'.rjust(size_width)}  {'UUID'.ljust(uuid_width)} ║"
+            sep = f"╠{'═' * 9}{'═' * name_width}{'═' * (size_width + 2)}{'═' * (uuid_width + 2)}╣"
+            footer = f"╚{'═' * 9}{'═' * name_width}{'═' * (size_width + 2)}{'═' * (uuid_width + 2)}╝"
+        
+        print(top)
+        print(header)
+        print(sep)
+        
+        folder_count = 0
+        file_count = 0
+        
+        for item in items:
+            is_folder = item.get('type') == 'folder' or item.get('itemType') == 'folder'
+            icon = '📁' if is_folder else '📄'
+            if is_folder: folder_count += 1
+            else: file_count += 1
+            
+            name = item.get('name', 'Unknown')
+            if len(name) > name_width:
+                name = name[:name_width - 3] + '...'
+            name = name.ljust(name_width)
+            
+            size = '<DIR>' if is_folder else format_size(item.get('size', 0))
+            size = size.rjust(size_width)
+            
+            item_uuid = item.get('uuid', item.get('itemId', 'N/A'))
+            uuid_display = (item_uuid if show_uuids else f"{item_uuid[:8]}...").ljust(uuid_width)
+            
+            if detailed:
+                mod_raw = item.get('lastModified', item.get('timestamp', 0))
+                date_display = format_date(mod_raw).rjust(date_width)
+                print(f"║  {icon}  {name}  {size}  {date_display}  {uuid_display} ║")
+            else:
+                print(f"║  {icon}  {name}  {size}  {uuid_display} ║")
+        
+        print(footer)
+        print(f"\n📊 Total: {len(items)} items ({folder_count} folders, {file_count} files)")
+
 
     def handle_mkdir(self, args) -> int:
         """Handle mkdir command"""
@@ -685,6 +728,19 @@ WebDAV Examples:
     def handle_upload(self, args) -> int:
         """Handle upload command with batching and resume"""
         try:
+            # Fix for "upload src dest" pattern (e.g. 'filen upload "*.pdf" /texte')
+            # If target is default ('/') and we have multiple items in sources,
+            # we check if the last item is intended as a destination.
+            if args.target == '/' and len(args.sources) > 1:
+                potential_dest = args.sources[-1]
+                
+                # Heuristic: It's a target if it starts with '/' (remote path)
+                # OR if it doesn't exist locally (so it's not a source file)
+                if potential_dest.startswith('/') or not os.path.exists(potential_dest):
+                    args.target = potential_dest
+                    args.sources = args.sources[:-1]
+                    print(f"ℹ️  Inferring target: {args.target}")
+
             # Validate session for long-running operation
             self._prepare_client(validate_session=True)
             
@@ -772,116 +828,146 @@ WebDAV Examples:
             return 1
 
     def handle_download_path(self, args) -> int:
-        """Handle download-path command with batching and resume"""
+        """Handle download-path command with wildcards"""
         try:
-            # Validate session for long-running operation
+            # Validate session
             self._prepare_client(validate_session=True)
             
-            # Generate batch ID
-            batch_id = self.config.generate_batch_id('download', [args.path], args.target or '.')
-            print(f"🔄 Batch ID: {batch_id}")
+            # 1. Expand Sources
+            items = self._expand_remote_path(args.path)
             
-            # Load batch state
+            # 2. Filter
+            include = getattr(args, 'include', []) or []
+            exclude = getattr(args, 'exclude', []) or []
+            
+            items_to_process = [i for i in items if self._should_process_item(i['name'], include, exclude)]
+            
+            if not items_to_process:
+                print(f"❌ No items found matching '{args.path}'")
+                return 1
+
+            # Determine Target Directory
+            target_dir = args.target or '.'
+            if len(items_to_process) > 1 and not os.path.isdir(target_dir):
+                os.makedirs(target_dir, exist_ok=True)
+
+            print(f"📥 Downloading {len(items_to_process)} items to '{target_dir}'...")
+
+            # 3. Execute Batch
+            # We reuse the existing batch logic by creating a task list manually
+            # or simply calling the drive service for each if simple
+            
+            # Use batch ID
+            batch_id = self.config.generate_batch_id('download', [i['path'] for i in items_to_process], target_dir)
             batch_state = self.config.load_batch_state(batch_id)
-            
-            # Download
-            self.drive.download_path(
-                args.path,
-                local_destination=args.target,
-                recursive=args.recursive,
-                on_conflict=args.on_conflict,
-                preserve_timestamps=args.preserve_timestamps,
-                include=args.include or [],
-                exclude=args.exclude or [],
-                batch_id=batch_id,
-                initial_batch_state=batch_state,
-                save_state_callback=lambda state: self.config.save_batch_state(batch_id, state)
-            )
-            
-            # Clean up batch state
-            self.config.delete_batch_state(batch_id)
-            print("✅ Download batch completed successfully")
-            
+
+            success = 0
+            for item in items_to_process:
+                try:
+                    # If it's a folder, we use the recursive download logic
+                    if item['type'] == 'folder':
+                        self.drive.download_path(
+                            item['path'],
+                            local_destination=target_dir,
+                            recursive=args.recursive,
+                            on_conflict=args.on_conflict,
+                            preserve_timestamps=args.preserve_timestamps,
+                            include=include, # Pass filters down
+                            exclude=exclude
+                        )
+                        success += 1
+                    else:
+                        # Single file
+                        self.drive.download_file(
+                            item['uuid'],
+                            save_path=os.path.join(target_dir, item['name']),
+                            preserve_timestamps=args.preserve_timestamps
+                        )
+                        success += 1
+                        print(f"  ✅ {item['name']}")
+                
+                except Exception as e:
+                    print(f"  ❌ Error downloading {item['name']}: {e}")
+
             return 0
-        
+            
         except Exception as e:
             print(f"❌ Download failed: {e}")
-            if self.debug:
-                import traceback
-                traceback.print_exc()
             return 1
 
     def handle_move(self, args) -> int:
-        """Handle move command"""
-        try:
-            self._prepare_client()
-            
-            src = self.drive.resolve_path(args.source)
-            
-            # Resolve or create destination
-            try:
-                dest = self.drive.resolve_path(args.dest)
-                if dest['type'] != 'folder':
-                    print(f"❌ Destination must be a folder")
-                    return 1
-                dest_uuid = dest['uuid']
-            except FileNotFoundError:
-                dest_info = self.drive.create_folder_recursive(args.dest)
-                dest_uuid = dest_info['uuid']
-            
-            print(f"🚚 Moving \"{src['path']}\" to \"{args.dest}\"...")
-            
-            self.drive.move_item(src['uuid'], dest_uuid, src['type'])
-            
-            print("✅ Move completed successfully")
-            return 0
-        
-        except Exception as e:
-            print(f"❌ Move failed: {e}")
-            if self.debug:
-                import traceback
-                traceback.print_exc()
-            return 1
+        """Handle move command with wildcards"""
+        return self._handle_transfer('move', args)
 
     def handle_copy(self, args) -> int:
-        """Handle copy command"""
+        """Handle copy command with wildcards"""
+        return self._handle_transfer('copy', args)
+
+    def _handle_transfer(self, mode: str, args) -> int:
+        """Shared logic for mv/cp"""
         try:
             self._prepare_client()
             
-            src = self.drive.resolve_path(args.source)
-            if src['type'] == 'folder':
-                print("❌ Folder copy not yet supported")
+            # 1. Expand Source(s)
+            sources = self._expand_remote_path(args.source)
+            
+            # 2. Filter Sources
+            include = getattr(args, 'include', []) or []
+            exclude = getattr(args, 'exclude', []) or []
+            
+            items_to_process = [i for i in sources if self._should_process_item(i['name'], include, exclude)]
+            
+            if not items_to_process:
+                print(f"❌ No items found matching '{args.source}'")
                 return 1
             
-            # Resolve destination
+            # 3. Resolve Destination
+            # If we have multiple sources, dest MUST be a folder
             try:
                 dest = self.drive.resolve_path(args.dest)
-                if dest['type'] == 'folder':
-                    dest_uuid = dest['uuid']
-                    target_name = os.path.basename(args.source)
-                else:
-                    if not self.force:
-                        print("❌ Destination exists. Use -f to overwrite.")
-                        return 1
-                    parent_path = os.path.dirname(args.dest)
-                    dest_folder = self.drive.resolve_path(parent_path if parent_path else '/')
-                    dest_uuid = dest_folder['uuid']
-                    target_name = os.path.basename(args.dest)
+                if len(items_to_process) > 1 and dest['type'] != 'folder':
+                     print(f"❌ Destination '{args.dest}' must be a folder when processing multiple items.")
+                     return 1
             except FileNotFoundError:
-                parent_path = os.path.dirname(args.dest)
-                dest_folder = self.drive.create_folder_recursive(parent_path if parent_path else '/')
-                dest_uuid = dest_folder['uuid']
-                target_name = os.path.basename(args.dest)
+                # If moving multiple items, create dest as folder
+                if len(items_to_process) > 1 or args.dest.endswith('/'):
+                    print(f"📂 Creating destination folder '{args.dest}'...")
+                    dest = self.drive.create_folder_recursive(args.dest)
+                else:
+                    # Single item rename/move scenario logic handled inside drive service usually,
+                    # but here we'll enforce folder structure for safety with wildcards
+                     print(f"❌ Destination '{args.dest}' not found.")
+                     return 1
+
+            dest_uuid = dest['uuid']
+
+            # 4. Execute
+            success_count = 0
+            action_name = "Moving" if mode == 'move' else "Copying"
             
-            print(f"📋 Copying \"{src['path']}\"...")
+            print(f"📦 {action_name} {len(items_to_process)} items to '{args.dest}'...")
             
-            self.drive.copy_file(src['uuid'], dest_uuid, target_name)
-            
-            print("✅ Copy completed successfully")
+            for item in items_to_process:
+                try:
+                    if mode == 'move':
+                        self.drive.move_item(item['uuid'], dest_uuid, item['type'])
+                    else:
+                        # Copy
+                        if item['type'] == 'folder':
+                            print(f"⚠️  Skipping folder '{item['name']}' (Folder copy not supported)")
+                            continue
+                        self.drive.copy_file(item['uuid'], dest_uuid, item['name'])
+                    
+                    print(f"  ✅ {item['name']}")
+                    success_count += 1
+                except Exception as e:
+                    print(f"  ❌ Error processing {item['name']}: {e}")
+
+            print(f"✅ {action_name} completed. ({success_count}/{len(items_to_process)} successful)")
             return 0
-        
+            
         except Exception as e:
-            print(f"❌ Copy failed: {e}")
+            print(f"❌ Operation failed: {e}")
             if self.debug:
                 import traceback
                 traceback.print_exc()
@@ -1063,68 +1149,28 @@ WebDAV Examples:
                 traceback.print_exc()
             return 1
 
-    # trash, search, find, tree, webdav handlers all follow the same pattern with _prepare_client()
-    
     def handle_list_trash(self, args) -> int:
-        """Handle list-trash command"""
+        """Handle list-trash command with filtering"""
         try:
             self._prepare_client()
             
             print("🗑️ Listing trash contents...\n")
-            
             items = self.drive.get_trash_content()
             
-            if not items:
-                print("📭 Trash is empty")
+            # Apply Filters
+            include = getattr(args, 'include', []) or []
+            exclude = getattr(args, 'exclude', []) or []
+            filtered = [i for i in items if self._should_process_item(i['name'], include, exclude)]
+            
+            if not filtered:
+                print("📭 Trash is empty (or all items filtered)")
                 return 0
             
-            # Build table (same as handle_list)
-            name_width = 40
-            size_width = 12
-            uuid_width = 36 if args.uuids else 11
-            
-            top = f"╔{'═' * 9}{'═' * name_width}{'═' * (size_width + 2)}{'═' * (uuid_width + 2)}╗"
-            header = f"║  Type    {'Name'.ljust(name_width)}  {'Size'.rjust(size_width)}  {'UUID'.ljust(uuid_width)} ║"
-            sep = f"╠{'═' * 9}{'═' * name_width}{'═' * (size_width + 2)}{'═' * (uuid_width + 2)}╣"
-            footer = f"╚{'═' * 9}{'═' * name_width}{'═' * (size_width + 2)}{'═' * (uuid_width + 2)}╝"
-            
-            print(top)
-            print(header)
-            print(sep)
-            
-            folder_count = 0
-            file_count = 0
-            
-            for item in items:
-                icon = '📁' if item['type'] == 'folder' else '📄'
-                if item['type'] == 'folder':
-                    folder_count += 1
-                else:
-                    file_count += 1
-                
-                name = item['name']
-                if len(name) > name_width:
-                    name = name[:name_width - 3] + '...'
-                name = name.ljust(name_width)
-                
-                size = '<DIR>' if item['type'] == 'folder' else format_size(item.get('size', 0))
-                size = size.rjust(size_width)
-                
-                item_uuid = item.get('uuid', 'N/A')
-                uuid_display = (item_uuid if args.uuids else f"{item_uuid[:8]}...").ljust(uuid_width)
-                
-                print(f"║  {icon}  {name}  {size}  {uuid_display} ║")
-            
-            print(footer)
-            print(f"\n📊 Total: {len(items)} items ({folder_count} folders, {file_count} files)")
-            
+            self._print_item_list(filtered, detailed=True, show_uuids=args.uuids)
             return 0
-        
+            
         except Exception as e:
             print(f"❌ List trash failed: {e}")
-            if self.debug:
-                import traceback
-                traceback.print_exc()
             return 1
 
     def handle_tree(self, args) -> int:
@@ -1517,21 +1563,31 @@ WebDAV Examples:
             return 1
 
     def handle_search(self, args) -> int:
-        """Handle search command (Global find)"""
+        """Handle search command with filtering"""
         try:
             self._prepare_client()
             
-            # Map search to a global recursive find
-            print(f"🔍 Searching for \"*{args.query}*\"...")
+            print(f"🔍 Searching for \"{args.query}\"...")
             
+            # This is server-side fuzzy search
             results = self.drive.find_files('/', f'*{args.query}*')
             
-            if not results:
+            # Apply Client-side Filters
+            include = getattr(args, 'include', []) or []
+            exclude = getattr(args, 'exclude', []) or []
+            
+            filtered = []
+            for item in results:
+                # find_files returns objects with 'name', 'path', etc.
+                if self._should_process_item(item['name'], include, exclude):
+                    filtered.append(item)
+
+            if not filtered:
                 print("   No matches found")
                 return 0
                 
-            print(f"\nFound {len(results)} matches:")
-            for item in results:
+            print(f"\nFound {len(filtered)} matches:")
+            for item in filtered:
                 uuid_str = f" ({item['uuid']})" if args.uuids else ""
                 print(f"   {item['fullPath']}{uuid_str}")
                 
