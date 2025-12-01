@@ -68,10 +68,15 @@ class StreamingFileWrapper:
     def read(self, size=-1):
         # Initialize generator if needed (lazy loading)
         if self.generator is None:
-            self.generator = self.drive.download_file_generator(
-                self.uuid, 
-                offset=self.position
-            )
+            try:
+                self.generator = self.drive.download_file_generator(
+                    self.uuid, 
+                    offset=self.position
+                )
+            except Exception as e:
+                # If download fails to start, return empty (triggers 500 upstream usually)
+                print(f"⚠️ Stream start failed: {e}")
+                return b""
             
         # Helper to fetch chunks until we have enough data
         def fill_buffer(target_size):
@@ -81,13 +86,19 @@ class StreamingFileWrapper:
                     self.buffer += chunk
             except StopIteration:
                 pass
+            except Exception as e:
+                # Log other generator errors (decryption/network)
+                print(f"⚠️ Stream read error: {e}")
 
         if size == -1:
             # Read everything
             chunks = [self.buffer]
             self.buffer = b""
-            for chunk in self.generator:
-                chunks.append(chunk)
+            try:
+                for chunk in self.generator:
+                    chunks.append(chunk)
+            except Exception:
+                pass
             data = b"".join(chunks)
             self.position += len(data)
             return data

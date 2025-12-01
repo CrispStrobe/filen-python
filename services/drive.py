@@ -30,7 +30,7 @@ class ChunkUploadException(Exception):
 
 
 class DriveService:
-    """Handles all file operations - matches Dart FilenClient"""
+    """Handles all file operations"""
 
     def __init__(self):
         self.config = config_service
@@ -280,7 +280,6 @@ class DriveService:
     def resolve_path(self, path: str) -> Dict[str, Any]:
         """
         Resolve a path to a folder or file
-        Matches Dart implementation
         """
         if not self.base_folder_uuid:
             raise ValueError("Not logged in")
@@ -379,7 +378,6 @@ class DriveService:
     def create_folder_recursive(self, path: str) -> Dict[str, Any]:
         """
         Create folders recursively
-        Matches Dart implementation
         """
         if not self.base_folder_uuid:
             raise ValueError("Not logged in")
@@ -473,11 +471,10 @@ class DriveService:
         preserve_timestamps: bool = False,
         on_progress: Optional[Callable[[int, int, int, int], None]] = None,
         on_upload_start: Optional[Callable[[str, str], None]] = None,
-        target_filename: Optional[str] = None  # <--- NEW PARAMETER
+        target_filename: Optional[str] = None  # for webdav override
     ) -> Dict[str, str]:
         """
         Upload file in chunks with resume support
-        Matches Dart uploadFileChunked implementation
         """
         import requests
         
@@ -688,7 +685,6 @@ class DriveService:
     ) -> None:
         """
         Batch upload with resume support
-        Matches Dart upload implementation
         """
         include = include or []
         exclude = exclude or []
@@ -946,7 +942,6 @@ class DriveService:
                      on_progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, Any]:
         """
         Download file from Filen
-        Matches Dart implementation
         """
         import requests
         
@@ -1027,7 +1022,6 @@ class DriveService:
     ) -> None:
         """
         Batch download with resume support
-        Matches Dart downloadPath implementation
         """
         include = include or []
         exclude = exclude or []
@@ -1245,7 +1239,6 @@ class DriveService:
     def copy_file(self, src_uuid: str, dest_folder_uuid: str, new_name: Optional[str] = None) -> None:
         """
         Copy file (download then re-upload)
-        Matches Dart handleCopy implementation
         """
         import tempfile
         
@@ -1334,7 +1327,6 @@ class DriveService:
     def get_trash_content(self) -> List[Dict[str, Any]]:
         """
         Get trash contents
-        Matches Dart getTrashContent implementation
         """
         # Use special "trash" UUID
         content = self.api.get_dir_content('trash', folders_only=False)
@@ -1399,7 +1391,6 @@ class DriveService:
     def find_files(self, start_path: str, pattern: str, max_depth: int = -1) -> List[Dict[str, Any]]:
         """
         Find files matching pattern
-        Matches Dart findFiles implementation
         """
         import fnmatch
         
@@ -1460,7 +1451,6 @@ class DriveService:
                    max_depth: int = 3, current_depth: int = 0, prefix: str = "") -> None:
         """
         Print folder tree
-        Matches Dart printTree implementation
         """
         if current_depth >= max_depth:
             return
@@ -1516,7 +1506,6 @@ class DriveService:
     def verify_upload_metadata(self, file_uuid: str, local_file: str) -> bool:
         """
         Verify uploaded file using metadata hash (no download needed)
-        Matches Dart verifyUploadMetadata implementation
         """
         self._log("Verifying upload using metadata check...")
         

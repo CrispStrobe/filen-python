@@ -17,7 +17,7 @@ from services.network_utils import network_utils
 from services.webdav_server import webdav_server
 
 class FilenCLI:
-    """Main CLI application - matches Dart FilenCLI"""
+    """Main CLI application"""
 
     def __init__(self):
         self.config = config_service
@@ -141,10 +141,15 @@ WebDAV Examples:
         # Trash
         trash_parser = subparsers.add_parser('trash', help='Move to trash')
         trash_parser.add_argument('path', help='Item path')
+        trash_parser.add_argument('--include', action='append', help='Include pattern')
+        trash_parser.add_argument('--exclude', action='append', help='Exclude pattern')
+        trash_parser.add_argument('-r', '--recursive', action='store_true', help='Allow deleting folders via wildcard')
         
         # Delete
         delete_parser = subparsers.add_parser('delete-path', help='Permanently delete')
         delete_parser.add_argument('path', help='Item path')
+        delete_parser.add_argument('--include', action='append', help='Include pattern')
+        delete_parser.add_argument('--exclude', action='append', help='Exclude pattern')
         
         # Verify
         verify_parser = subparsers.add_parser('verify', help='Verify upload (SHA-512)')
@@ -493,6 +498,85 @@ WebDAV Examples:
             raise
 
     # ============================================================================
+    # WILDCARD & FILTER HELPERS
+    # ============================================================================
+
+    def _should_process_item(self, name: str, include: list, exclude: list) -> bool:
+        """Filter items based on include/exclude patterns"""
+        import fnmatch
+        
+        # If include patterns exist, file MUST match at least one
+        if include:
+            if not any(fnmatch.fnmatch(name, pattern) for pattern in include):
+                return False
+                
+        # If exclude patterns exist, file MUST NOT match any
+        if exclude:
+            if any(fnmatch.fnmatch(name, pattern) for pattern in exclude):
+                return False
+                
+        return True
+
+    def _expand_remote_path(self, path_pattern: str) -> list:
+        """
+        Expands a remote path with wildcards into a list of actual items.
+        Example: "/Code/project_*" -> returns list of matching file/folder objects
+        """
+        import fnmatch
+        
+        # If no wildcard, just resolve strictly
+        if not any(char in path_pattern for char in ['*', '?', '[']):
+            try:
+                resolved = self.drive.resolve_path(path_pattern)
+                return [{
+                    'uuid': resolved['uuid'],
+                    'type': resolved['type'],
+                    'path': resolved['path'],
+                    'name': resolved['metadata']['name']
+                }]
+            except FileNotFoundError:
+                return []
+
+        # Split into parent dir and pattern
+        path_pattern = path_pattern.replace('\\', '/')
+        parent_path = os.path.dirname(path_pattern)
+        pattern = os.path.basename(path_pattern)
+        
+        if not parent_path:
+            parent_path = '/'
+            
+        try:
+            # Resolve parent folder
+            parent_node = self.drive.resolve_path(parent_path)
+            if parent_node['type'] != 'folder':
+                return []
+                
+            parent_uuid = parent_node['uuid']
+            
+            # List contents to match against
+            files = self.drive.list_files(parent_uuid, detailed=False)
+            folders = self.drive.list_folders(parent_uuid, detailed=False)
+            all_items = files + folders
+            
+            matches = []
+            for item in all_items:
+                if fnmatch.fnmatch(item['name'], pattern):
+                    full_path = os.path.join(parent_path, item['name']).replace('\\', '/')
+                    matches.append({
+                        'uuid': item['uuid'],
+                        'type': item['type'],
+                        'path': full_path,
+                        'name': item['name']
+                    })
+            
+            return matches
+
+        except Exception as e:
+            if "not found" in str(e).lower():
+                return []
+            raise e
+
+    # ============================================================================
     # FILE OPERATION HANDLERS (Updated to use _prepare_client)
     # ============================================================================
 
@@ -825,24 +909,57 @@ WebDAV Examples:
             return 1
 
     def handle_trash(self, args) -> int:
-        """Handle trash command"""
+        """Handle trash command with wildcards"""
         try:
             self._prepare_client()
             
-            src = self.drive.resolve_path(args.path)
+            # 1. Expand Wildcards
+            items = self._expand_remote_path(args.path)
             
+            # Get filter lists (might be None in argparse)
+            include = getattr(args, 'include', []) or []
+            exclude = getattr(args, 'exclude', []) or []
+            recursive = getattr(args, 'recursive', False)
+            
+            # 2. Apply Filters
+            items_to_process = []
+            for item in items:
+                if self._should_process_item(item['name'], include, exclude):
+                    items_to_process.append(item)
+            
+            if not items_to_process:
+                print(f"❌ No items found matching '{args.path}'")
+                return 1
+
+            # 3. Confirmation
+            print(f"🔍 Found {len(items_to_process)} items to trash:")
+            for item in items_to_process[:10]:
+                print(f"  - {item['path']} ({item['type']})")
+            if len(items_to_process) > 10:
+                print(f"  ... and {len(items_to_process) - 10} more.")
+
             if not self.force:
-                prompt = f"❓ Move {src['type']} \"{args.path}\" to trash? [y/N]: "
-                response = input(prompt)
+                response = input(f"❓ Move these {len(items_to_process)} items to trash? [y/N]: ")
                 if response.lower() not in ['y', 'yes']:
                     print("❌ Cancelled")
                     return 0
-            
-            print(f"🗑️ Moving \"{src['path']}\" to trash...")
-            
-            self.drive.trash_item(src['uuid'], src['type'])
-            
-            print("✅ Item moved to trash successfully")
+
+            # 4. Execution
+            success_count = 0
+            for item in items_to_process:
+                try:
+                    # Safety check for folders in wildcard mode
+                    if item['type'] == 'folder' and not recursive and ('*' in args.path or '?' in args.path):
+                         print(f"⚠️  Skipping folder '{item['name']}' (use -r to include folders in wildcard match)")
+                         continue
+
+                    print(f"🗑️ Moving \"{item['path']}\" to trash...")
+                    self.drive.trash_item(item['uuid'], item['type'])
+                    success_count += 1
+                except Exception as e:
+                    print(f"❌ Error trashing {item['name']}: {e}")
+
+            print(f"✅ Successfully moved {success_count} items to trash")
             return 0
         
         except Exception as e:
@@ -853,26 +970,51 @@ WebDAV Examples:
             return 1
 
     def handle_delete(self, args) -> int:
-        """Handle delete-path command"""
+        """Handle delete-path command with wildcards"""
         try:
             self._prepare_client()
             
-            src = self.drive.resolve_path(args.path)
+            # 1. Expand
+            items = self._expand_remote_path(args.path)
             
-            print("⚠️ WARNING: This will PERMANENTLY delete the item!")
+            include = getattr(args, 'include', []) or []
+            exclude = getattr(args, 'exclude', []) or []
             
+            # 2. Filter
+            items_to_process = []
+            for item in items:
+                if self._should_process_item(item['name'], include, exclude):
+                    items_to_process.append(item)
+            
+            if not items_to_process:
+                print(f"❌ No items found matching '{args.path}'")
+                return 1
+
+            # 3. Confirmation
+            print("⚠️  WARNING: PERMANENT DELETION detected!")
+            print(f"🔍 Found {len(items_to_process)} items to DELETE PERMANENTLY:")
+            for item in items_to_process[:5]:
+                print(f"  🔥 {item['path']}")
+            if len(items_to_process) > 5:
+                print(f"  ... {len(items_to_process) - 5} more")
+
             if not self.force:
-                prompt = f"❓ Permanently delete {src['type']} \"{args.path}\"? [y/N]: "
-                response = input(prompt)
-                if response.lower() not in ['y', 'yes']:
+                response = input("❓ Type 'DELETE' to confirm permanent deletion: ")
+                if response != 'DELETE':
                     print("❌ Cancelled")
                     return 0
-            
-            print(f"🗑️ Permanently deleting \"{src['path']}\"...")
-            
-            self.drive.delete_permanent(src['uuid'], src['type'])
-            
-            print("✅ Item permanently deleted")
+
+            # 4. Execution
+            success_count = 0
+            for item in items_to_process:
+                try:
+                    print(f"🔥 Deleting \"{item['path']}\"...")
+                    self.drive.delete_permanent(item['uuid'], item['type'])
+                    success_count += 1
+                except Exception as e:
+                    print(f"❌ Error deleting {item['name']}: {e}")
+
+            print(f"✅ Permanently deleted {success_count} items")
             return 0
         
         except Exception as e:

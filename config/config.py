@@ -87,7 +87,7 @@ class ConfigService:
             batch_file.unlink()
 
     def generate_batch_id(self, operation_type: str, sources: list, target: str) -> str:
-        """Generate unique batch ID - matches Dart implementation"""
+        """Generate unique batch ID"""
         input_str = f"{operation_type}-{'|'.join(str(s) for s in sources)}-{target}"
         return hashlib.sha1(input_str.encode()).hexdigest()[:16]
 

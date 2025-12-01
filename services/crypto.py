@@ -25,7 +25,6 @@ class CryptoService:
     def derive_keys(self, password: str, auth_version: int, salt: str) -> Dict[str, str]:
         """
         Derive keys from password using PBKDF2
-        Matches Dart implementation exactly
         """
         # PBKDF2 with 200000 iterations, 64-byte output
         kdf = PBKDF2HMAC(
@@ -57,7 +56,7 @@ class CryptoService:
     def encrypt_metadata_002(self, text: str, key: str) -> str:
         """
         Encrypt metadata using version 002 format
-        Matches Dart: AES-256-GCM with 12-byte IV
+        AES-256-GCM with 12-byte IV
         """
         # Generate random 12-byte IV
         iv = self.random_string(12)
@@ -83,7 +82,6 @@ class CryptoService:
     def decrypt_metadata_002(self, encrypted: str, key: str) -> str:
         """
         Decrypt metadata using version 002 format
-        Matches Dart implementation
         """
         if not encrypted.startswith('002'):
             raise ValueError('Invalid metadata version')
@@ -113,7 +111,7 @@ class CryptoService:
     def encrypt_data(self, data: bytes, key: bytes) -> bytes:
         """
         Encrypt file data using AES-256-GCM
-        Matches Dart: 12-byte random IV prepended
+        12-byte random IV prepended
         """
         iv = os.urandom(12)
         
@@ -133,7 +131,6 @@ class CryptoService:
     def decrypt_data(self, encrypted: bytes, key: bytes) -> bytes:
         """
         Decrypt file data using AES-256-GCM
-        Matches Dart implementation
         """
         # Extract components
         iv = encrypted[:12]
@@ -150,7 +147,7 @@ class CryptoService:
         return decryptor.update(ciphertext) + decryptor.finalize()
 
     def hash_file_sha512(self, file_path: str, chunk_size: int = 1048576) -> str:
-        """Hash file using SHA-512 - matches Dart"""
+        """Hash file using SHA-512"""
         hasher = hashlib.sha512()
         
         with open(file_path, 'rb') as f:
@@ -162,7 +159,6 @@ class CryptoService:
     def hash_filename(self, filename: str, email: str, master_key: str) -> str:
         """
         Generate HMAC-SHA256 hash of filename
-        Matches Dart _hashFileName implementation
         """
         import hmac
         

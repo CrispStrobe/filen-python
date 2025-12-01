@@ -34,7 +34,6 @@ class APIClient:
                  use_auth: bool = True, max_retries: int = 3) -> Dict[str, Any]:
         """
         Make HTTP request with retry logic
-        Matches Dart _makeRequest implementation
         """
         url = f"{self.base_url}{endpoint}"
         headers = {'Content-Type': 'application/json'}

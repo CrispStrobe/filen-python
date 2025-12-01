@@ -27,7 +27,7 @@ class NetworkUtils:
     
     @classmethod
     def is_process_running(cls, pid: int) -> bool:
-        """Check if process is running - matches Dart _isProcessRunning"""
+        """Check if process is running"""
         try:
             if platform.system() == 'Windows':
                 # Windows: use tasklist
@@ -51,7 +51,6 @@ class NetworkUtils:
     def kill_process(cls, pid: int, force: bool = False) -> bool:
         """
         Kill process by PID
-        Matches Dart handleWebdavStop implementation
         """
         try:
             if platform.system() == 'Windows':
@@ -70,7 +69,7 @@ class NetworkUtils:
     
     @classmethod
     def get_local_ip(cls) -> str:
-        """Get local IP address - matches Dart _getLocalIpAddress"""
+        """Get local IP address"""
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
@@ -344,7 +343,6 @@ class NetworkUtils:
     def test_webdav_connection(cls, url: str, username: str, password: str) -> Dict[str, Any]:
         """
         Test WebDAV connection
-        Matches Dart handleWebdavTest implementation
         """
         try:
             import requests
