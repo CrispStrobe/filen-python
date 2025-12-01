@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 filen_cli/services/auth.py
-Authentication service for Filen CLI - ENHANCED VERSION
+Authentication service for Filen CLI
 """
 
 from datetime import datetime, timezone
@@ -13,7 +13,7 @@ from services.crypto import crypto_service
 
 
 class AuthService:
-    """Handles authentication flow - matches Internxt patterns"""
+    """Handles authentication flow"""
 
     def __init__(self):
         self.config = config_service
@@ -37,7 +37,6 @@ class AuthService:
     def do_login(self, email: str, password: str, tfa_code: Optional[str] = None) -> Dict[str, Any]:
         """
         Performs the full login flow and correctly handles credentials.
-        Matches Internxt do_login pattern
         """
         # Step 1: Get authentication info
         print("    📊 Getting authentication info...")
@@ -121,7 +120,6 @@ class AuthService:
     def login(self, email: str, password: str, tfa_code: Optional[str] = None) -> Dict[str, Any]:
         """
         Public login method - saves credentials after successful login
-        Matches Internxt pattern
         """
         credentials = self.do_login(email, password, tfa_code)
         self.config.save_credentials(credentials)
@@ -139,7 +137,6 @@ class AuthService:
     def get_auth_details(self) -> Dict[str, Any]:
         """
         Get saved credentials with validation
-        Matches Internxt get_auth_details pattern
         """
         credentials = self.config.read_credentials()
         
@@ -167,7 +164,6 @@ class AuthService:
     def logout(self) -> None:
         """
         Logout and clear credentials
-        Matches Internxt pattern
         """
         self.config.clear_credentials()
         self.api.set_auth(None)
@@ -176,7 +172,6 @@ class AuthService:
     def whoami(self) -> Optional[Dict[str, Any]]:
         """
         Get current user info
-        Matches Internxt pattern
         """
         try:
             credentials = self.get_auth_details()
@@ -207,10 +202,9 @@ class AuthService:
     def refresh_session(self) -> Dict[str, Any]:
         """
         Refresh session (Filen uses long-lived API keys, so this is a no-op)
-        Included for API compatibility with Internxt pattern
-        
-        Note: Filen doesn't have token refresh like Internxt.
-        If the API key becomes invalid, user must login again.
+        Included for API compatibility 
+        Note: Filen doesn't seem to have token refresh.
+        If the API key becomes invalid, user must probably login again.
         """
         try:
             credentials = self.get_auth_details()
