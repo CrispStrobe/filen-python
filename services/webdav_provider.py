@@ -56,6 +56,20 @@ class FilenDAVResource(DAVNonCollection):
     def get_etag(self) -> str:
         return f"{self.metadata['uuid']}-{self.metadata.get('lastModified')}"
 
+    # --- REQUIRED ABSTRACT METHODS IMPLEMENTATION ---
+    def support_etag(self) -> bool:
+        """Support ETags"""
+        return True
+
+    def support_modified(self) -> bool:
+        """Support last modified date"""
+        return True
+        
+    def support_content_length(self) -> bool:
+        """Support content length"""
+        return True
+    # ------------------------------------------------
+
     def support_ranges(self) -> bool:
         return True
 
@@ -127,6 +141,20 @@ class FilenDAVCollection(DAVCollection):
     def __init__(self, path: str, environ: dict, metadata: dict):
         super().__init__(path, environ)
         self.metadata = metadata
+
+    # --- REQUIRED ABSTRACT METHODS IMPLEMENTATION ---
+    def support_etag(self) -> bool:
+        """Support ETags"""
+        return True
+
+    def support_modified(self) -> bool:
+        """Support last modified date"""
+        return True
+        
+    def support_content_length(self) -> bool:
+        """Collections do not have content length"""
+        return False
+    # ------------------------------------------------
         
     def get_member_names(self) -> List[str]:
         # Using cache logic from DriveService
@@ -175,7 +203,7 @@ class FilenDAVProvider(DAVProvider):
         self.preserve_timestamps = preserve_timestamps
         
         # Ensure we are logged in
-        if not auth_service.read_credentials():
+        if not auth_service.whoami():
             print("❌ WebDAV Provider: No credentials found. Please login first.")
 
     def get_resource_inst(self, path: str, environ: dict) -> Optional[Union['FilenDAVCollection', 'FilenDAVResource']]:
