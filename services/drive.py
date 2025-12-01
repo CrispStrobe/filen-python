@@ -712,46 +712,47 @@ class DriveService:
         save_state_callback: Optional[Callable[[Dict[str, Any]], None]] = None
     ) -> None:
         """
-        Batch upload with resume support
+        Batch upload with resume support and extensive logging
         """
         include = include or []
         exclude = exclude or []
         
-        self._log(f"Upload target path: {target_path}")
+        self._log(f"--- STARTING UPLOAD ---")
+        self._log(f"Sources: {sources}")
+        self._log(f"Target: {target_path}")
+        self._log(f"Options: recursive={recursive}, conflict={on_conflict}")
         
         # Load or create batch state
         if initial_batch_state:
             print("🔄 Resuming batch...")
+            self._log("Loaded initial batch state")
             batch_state = initial_batch_state
             tasks = batch_state['tasks']
-            
-            # Debug
-            self._log(f"Batch state loaded: {len(tasks)} tasks")
-            for i, task in enumerate(tasks):
-                self._log(f"  Task {i}: status={task['status']}, lastChunk={task.get('lastChunk', -1)}")
         else:
             print("🔍 Building task list...")
             tasks = []
             
-            # Resolve target folder (This now uses the path cache!)
+            # Resolve target folder
+            self._log(f"Resolving target folder: {target_path}")
             target_info = self.create_folder_recursive(target_path)
             target_uuid = target_info['uuid']
-            self._log(f"Target folder UUID: {target_uuid}")
+            self._log(f"Target UUID resolved: {target_uuid}")
             
             # Build task list
+            self._log("Scanning sources for files...")
             for source in sources:
-                # Expand glob patterns
+                self._log(f"expanding glob: {source}")
                 expanded = glob_module.glob(source, recursive=True)
+                self._log(f"Found {len(expanded)} items in source")
                 
                 for item_path in expanded:
                     item = Path(item_path)
                     
                     if item.is_dir():
                         if not recursive:
-                            self._log(f"Skipping directory (not recursive): {item_path}")
+                            self._log(f"Skipping dir (non-recursive): {item}")
                             continue
                         
-                        # Walk directory
                         for root, dirs, files in os.walk(item):
                             for filename in files:
                                 file_path = os.path.join(root, filename)
@@ -767,10 +768,11 @@ class DriveService:
                                         'uploadKey': None,
                                         'lastChunk': -1
                                     })
+                                else:
+                                    self._log(f"Filtered out: {filename}")
                     
                     elif item.is_file():
                         remote_path = os.path.join(target_path, item.name).replace('\\', '/')
-                        
                         if self.should_include_file(item.name, include, exclude):
                             tasks.append({
                                 'localPath': str(item),
@@ -780,6 +782,8 @@ class DriveService:
                                 'uploadKey': None,
                                 'lastChunk': -1
                             })
+                        else:
+                            self._log(f"Filtered out: {item.name}")
             
             batch_state = {
                 'operationType': 'upload',
@@ -791,83 +795,70 @@ class DriveService:
                 save_state_callback(batch_state)
             
             print(f"📝 Task list: {len(tasks)} files")
+            self._log(f"Task list built with {len(tasks)} items")
         
-        # --- COUNTERS INITIALIZATION ---
         success_count = 0
         skipped_count = 0
         error_count = 0
         completed_previously = 0
         
-        # --- MODIFIED: TQDM Progress Bar Wrapper ---
-        with tqdm(total=len(tasks), unit="file", desc="Uploading", disable=None) as pbar:
+        completed_count = sum(1 for t in tasks if t['status'] == 'completed')
+        self._log(f"Previously completed: {completed_count}")
+        
+        with tqdm(total=len(tasks), initial=completed_count, unit="file", desc="Uploading", disable=None) as pbar:
             for i, task in enumerate(tasks):
                 local_path = task['localPath']
                 remote_path = task['remotePath']
                 status = task['status']
-                file_uuid = task.get('fileUuid')
-                upload_key = task.get('uploadKey')
-                last_chunk = task.get('lastChunk', -1)
                 
-                # Update progress bar description with current filename
                 remote_filename = os.path.basename(remote_path)
                 pbar.set_description(f"Up: {remote_filename[:20]:<20}")
 
-                # Debug
-                self._log(f"Processing task {i}: {Path(local_path).name}")
-                self._log(f"  Status: {status}")
-                self._log(f"  UUID: {file_uuid[:8] if file_uuid else 'None'}...")
-                self._log(f"  LastChunk: {last_chunk}")
-                
-                # 1. Handle items completed in previous runs
+                # Debug every 10th item or if specific status
+                if i % 10 == 0: self._log(f"Processing index {i}: {remote_filename}")
+
                 if status == 'completed':
                     completed_previously += 1
-                    pbar.update(1)
+                    # self._log(f"Skipping completed: {remote_filename}")
                     continue
                 
-                # 2. Handle Skipped/Pending items on resume
                 if status.startswith('skipped'):
                     skipped_count += 1
                     pbar.update(1)
                     continue
                 
-                # 3. Check local file exists
                 if not os.path.exists(local_path):
                     if self.debug: print(f"⚠️  Source missing: {Path(local_path).name}")
                     skipped_count += 1
                     task['status'] = 'skipped_missing'
-                    if save_state_callback:
-                        save_state_callback(batch_state)
+                    if save_state_callback: save_state_callback(batch_state)
                     pbar.update(1)
                     continue
                 
-                # 4. Resolve parent folder (Uses _path_cache optimization)
+                # Resolve parent folder
                 remote_parent = os.path.dirname(remote_path).replace('\\', '/')
                 try:
+                    # self._log(f"Ensuring parent exists: {remote_parent}")
                     parent_info = self.create_folder_recursive(remote_parent)
                 except Exception as e:
                     if self.debug: print(f"❌ Error creating parent {remote_parent}: {e}")
                     error_count += 1
                     task['status'] = 'error_parent'
-                    if save_state_callback:
-                        save_state_callback(batch_state)
+                    if save_state_callback: save_state_callback(batch_state)
                     pbar.update(1)
                     continue
                 
-                # 5. Check conflict (Uses cache optimization)
-                # If we don't have a resume UUID, check if file exists on server
+                # Check conflict
                 should_upload = True
-                if not file_uuid:
+                if not task.get('fileUuid'):
                     name_hashed = self.crypto.hash_filename(remote_filename, self.email, self._get_master_key())
                     
-                    # Optimization: Check local cache first before making API call
-                    # (Assumes parent_info['uuid'] cache was populated by create_folder_recursive)
-                    cached_files = self._file_cache.get(parent_info['uuid'], {}).get('data', [])
-                    exists = False
+                    # self._log(f"Checking existence: {remote_filename} in {parent_info['uuid']}")
+                    existing_files = self.list_files(parent_info['uuid'], detailed=False)
+                    exists = any(f['name'] == remote_filename for f in existing_files)
                     
-                    if cached_files:
-                        exists = any(f['name'] == remote_filename for f in cached_files)
-                    else:
-                        # Fallback to API check if cache missing
+                    if not exists:
+                        # Fallback API check if cache empty
                         exists = self.api.check_file_exists(parent_info['uuid'], name_hashed)
                     
                     if exists:
@@ -875,58 +866,47 @@ class DriveService:
                             if self.debug: print(f"⏭️  Skipping: {remote_filename} (exists)")
                             skipped_count += 1
                             task['status'] = 'skipped_conflict'
-                            if save_state_callback:
-                                save_state_callback(batch_state)
+                            if save_state_callback: save_state_callback(batch_state)
                             pbar.update(1)
                             should_upload = False
-                        # If overwrite, we proceed (API handles replacement/versioning)
                 
                 if not should_upload:
                     continue
                 
-                # 6. Perform Upload
+                # Upload
                 try:
                     file_size = os.path.getsize(local_path)
-                    
-                    is_resuming = (status in ['interrupted', 'uploading']) and last_chunk >= 0
+                    is_resuming = (status in ['interrupted', 'uploading']) and task.get('lastChunk', -1) >= 0
                     
                     if self.debug:
                         if is_resuming:
-                            print(f"📤 Resuming: {remote_filename} from chunk {last_chunk + 1} ({format_size(file_size)})")
+                            print(f"📤 Resuming: {remote_filename} ({format_size(file_size)})")
                         else:
                             print(f"📤 Uploading: {remote_filename} ({format_size(file_size)})")
                     
                     task['status'] = 'uploading'
-                    if save_state_callback:
-                        save_state_callback(batch_state)
+                    if save_state_callback: save_state_callback(batch_state)
                     
-                    # Track saves for callback
                     last_save_time = datetime.now()
-                    last_saved_chunk = last_chunk
+                    last_saved_chunk = task.get('lastChunk', -1)
                     
                     def on_upload_start_handler(uuid: str, key: str):
-                        self._log(f"Upload started: uuid={uuid[:8]}..., key={key[:8]}...")
+                        # self._log(f"Upload initiated: {uuid}")
                         task['fileUuid'] = uuid
                         task['uploadKey'] = key
                         task['lastChunk'] = -1
-                        if save_state_callback:
-                            save_state_callback(batch_state)
+                        if save_state_callback: save_state_callback(batch_state)
                     
                     def on_progress_handler(current: int, total: int, bytes_up: int, total_bytes: int):
                         nonlocal last_save_time, last_saved_chunk
                         task['lastChunk'] = current - 1
-                        
-                        # Save state every 5 seconds or every 10 chunks
                         now = datetime.now()
-                        should_save = (current - last_saved_chunk >= 10) or (now - last_save_time).seconds >= 5
-                        
-                        if should_save and save_state_callback:
-                            self._log(f"Saving progress: chunk {current - 1}")
-                            save_state_callback(batch_state)
+                        if (current - last_saved_chunk >= 10) or (now - last_save_time).seconds >= 5:
+                            if save_state_callback: save_state_callback(batch_state)
                             last_save_time = now
                             last_saved_chunk = current - 1
                     
-                    result = self.upload_file_chunked(
+                    self.upload_file_chunked(
                         local_path,
                         parent_info['uuid'],
                         file_uuid=task.get('fileUuid'),
@@ -938,9 +918,7 @@ class DriveService:
                     )
                     
                     if self.debug:
-                        print(f"   ✅ Upload complete")
-                        print(f"   📊 SHA-512: {result['hash'][:64]}...")
-                        print(f"   🆔 UUID: {result['uuid']}")
+                        print(f"   ✅ Complete: {remote_filename}")
                     
                     success_count += 1
                     task['status'] = 'completed'
@@ -949,42 +927,25 @@ class DriveService:
                     task['lastChunk'] = -1
                     
                 except ChunkUploadException as e:
-                    if self.debug: print(f"\n⚠️  Upload interrupted: {e.message}")
+                    if self.debug: print(f"\n⚠️  Interrupted: {e.message}")
                     task['fileUuid'] = e.file_uuid
                     task['uploadKey'] = e.upload_key
                     task['lastChunk'] = e.last_successful_chunk
                     task['status'] = 'interrupted'
                     error_count += 1
-                    
-                    if save_state_callback:
-                        save_state_callback(batch_state)
-                    
-                    if self.debug:
-                        print("💾 Progress saved.")
+                    if save_state_callback: save_state_callback(batch_state)
+                    if self.debug: print("💾 State saved")
                     
                 except Exception as e:
-                    if self.debug: print(f"\n❌ Upload error: {e}")
-                    if self.debug:
-                        import traceback
-                        traceback.print_exc()
+                    if self.debug: print(f"\n❌ Error uploading {remote_filename}: {e}")
                     error_count += 1
                     task['status'] = 'error_upload'
                 
-                if save_state_callback:
-                    save_state_callback(batch_state)
-                
+                if save_state_callback: save_state_callback(batch_state)
                 pbar.update(1)
         
-        # Summary
         print("\n" + "=" * 40)
-        print("📊 Upload Summary:")
-        if completed_previously > 0:
-            print(f"  ✅ Previous: {completed_previously}")
-        print(f"  ✅ Uploaded: {success_count}")
-        print(f"  ⏭️  Skipped: {skipped_count}")
-        print(f"  ❌ Errors: {error_count}")
-        print("=" * 40)
-        
+        print(f"📊 Summary: ✅ {success_count} | ⏭️ {skipped_count} | ❌ {error_count}")
         if error_count > 0:
             raise Exception(f"Upload completed with {error_count} errors")
 
@@ -1077,15 +1038,21 @@ class DriveService:
         save_state_callback: Optional[Callable[[Dict[str, Any]], None]] = None
     ) -> None:
         """
-        Batch download with resume support
+        Batch download with resume support and FAST tree retrieval (Handles list/dict responses)
         """
         include = include or []
         exclude = exclude or []
         
-        # Resolve item
-        item_info = self.resolve_path(remote_path)
+        self._log(f"--- STARTING DOWNLOAD ---")
+        self._log(f"Remote: {remote_path}")
+        self._log(f"Recursive: {recursive}")
         
-        # Handle single file
+        # Resolve item
+        self._log("Resolving remote path...")
+        item_info = self.resolve_path(remote_path)
+        self._log(f"Resolved: {item_info['type']} {item_info['uuid']}")
+        
+        # Handle single file (Simple non-batch logic)
         if item_info['type'] == 'file':
             filename = os.path.basename(remote_path)
             
@@ -1113,29 +1080,25 @@ class DriveService:
                     
                     if remote_mod_time:
                         local_mod_time = int(os.path.getmtime(local_path) * 1000)
-                        
                         if remote_mod_time <= local_mod_time:
                             print(f"⏭️  Skipping: {local_path} (local is newer)")
                             return
                         print(f"📥 Downloading: {filename} (remote is newer)")
             
             print(f"📥 Downloading: {filename}")
-            
             result = self.download_file(item_info['uuid'], save_path=local_path)
             
-            # Set timestamp
             if preserve_timestamps and result.get('lastModified'):
                 try:
                     mod_time = result['lastModified'] / 1000.0
                     os.utime(local_path, (mod_time, mod_time))
-                    print(f"   🕐 Set timestamp")
                 except Exception as e:
                     self._log(f"Could not set timestamp: {e}")
             
             print(f"✅ Downloaded: {local_path}")
             return
         
-        # Handle folder
+        # Handle folder (Batch Logic)
         if item_info['type'] == 'folder':
             if not recursive:
                 raise Exception(f"'{remote_path}' is a folder. Use -r for recursive download.")
@@ -1148,9 +1111,7 @@ class DriveService:
                 base_dest = folder_name
             
             os.makedirs(base_dest, exist_ok=True)
-            
-            print(f"📂 Downloading folder: {remote_path}")
-            print(f"💾 Target: {base_dest}")
+            self._log(f"Local Target: {base_dest}")
             
             # Load or create batch state
             if initial_batch_state:
@@ -1158,108 +1119,203 @@ class DriveService:
                 batch_state = initial_batch_state
                 tasks = batch_state['tasks']
             else:
-                print("🔍 Building task list...")
+                print("🔍 Building task list (Fast)...")
                 tasks = []
                 
-                # Build task list recursively
-                def build_tasks(current_uuid: str, current_rel_path: str):
-                    files = self.list_files(current_uuid, detailed=True)
-                    folders = self.list_folders(current_uuid, detailed=True)
+                # --- OPTIMIZATION: Use flattened tree endpoint ---
+                try:
+                    self._log(f"Calling get_flat_folder_tree for {item_info['uuid']}...")
+                    tree_data = self.api.get_flat_folder_tree(item_info['uuid'])
                     
-                    for file_info in files:
-                        filename = file_info['name']
-                        local_file_path = os.path.join(base_dest, current_rel_path, filename)
+                    raw_folders = tree_data.get('folders', [])
+                    # Support both 'uploads' and 'files' keys
+                    raw_files = tree_data.get('files', []) or tree_data.get('uploads', [])
+                    
+                    self._log(f"Tree Response: {len(raw_folders)} folders, {len(raw_files)} files")
+                    
+                    # 1. Map Folders
+                    folder_map = {}
+                    self._log("Mapping folder structure...")
+                    
+                    for f in raw_folders:
+                        # Normalize data (Handle dict vs list)
+                        if isinstance(f, list):
+                            # CORRECT SCHEMA FOR FOLDERS: [uuid, encrypted_name, parent_uuid]
+                            if len(f) < 3: continue
+                            f_data = {
+                                'uuid': f[0],
+                                'name_enc': f[1],
+                                'parent': f[2]
+                            }
+                        else:
+                            if f.get('deleted') or f.get('trash'): continue
+                            f_data = {
+                                'uuid': f.get('uuid'),
+                                'name_enc': f.get('name', ''),
+                                'parent': f.get('parent')
+                            }
+
+                        try:
+                            # Decrypt name
+                            enc_name = f_data['name_enc']
+                            dec_name = self._try_decrypt(enc_name)
+                            if dec_name.startswith('{'):
+                                dec_name = json.loads(dec_name).get('name', 'Unknown')
+                            
+                            folder_map[f_data['uuid']] = {
+                                'name': dec_name,
+                                'parent': f_data['parent']
+                            }
+                        except Exception:
+                            continue
+
+                    # Helper to trace path
+                    def get_rel_path(parent_uuid):
+                        path_parts = []
+                        curr = parent_uuid
+                        seen = set()
                         
-                        if self.should_include_file(filename, include, exclude):
+                        while curr and curr != item_info['uuid']:
+                            if curr in seen: return None # Cycle
+                            seen.add(curr)
+                            
+                            if curr not in folder_map: 
+                                return None # Orphaned or parent not in tree
+                            
+                            folder = folder_map[curr]
+                            path_parts.append(folder['name'])
+                            curr = folder['parent']
+                        
+                        return os.path.join(*reversed(path_parts)) if path_parts else ''
+
+                    # 2. Process Files
+                    self._log("Processing file list...")
+                    for f in raw_files:
+                        # Normalize data (Handle dict vs list)
+                        if isinstance(f, list):
+                            # CORRECT SCHEMA FOR FILES based on logs:
+                            # [0:uuid, 1:bucket, 2:region, 3:chunks, 4:parent, 5:metadata_enc, ...]
+                            if len(f) < 6:
+                                if self.debug: self._log(f"⚠️ Skipping malformed file list item: {f}")
+                                continue
+                                
+                            f_data = {
+                                'uuid': f[0],
+                                'metadata_enc': f[5], # FIXED: Index 5 is metadata
+                                'parent': f[4]        # FIXED: Index 4 is parent
+                            }
+                        else:
+                            if f.get('deleted') or f.get('trash'): continue
+                            f_data = {
+                                'uuid': f.get('uuid'),
+                                'metadata_enc': f.get('metadata', ''),
+                                'parent': f.get('parent')
+                            }
+
+                        try:
+                            # Decrypt metadata
+                            enc_meta = f_data['metadata_enc']
+                            dec_meta = self._try_decrypt(enc_meta)
+                            meta = json.loads(dec_meta)
+                            
+                            filename = meta.get('name', 'Unknown')
+                            
+                            if not self.should_include_file(filename, include, exclude):
+                                continue
+                                
+                            rel_dir = get_rel_path(f_data['parent'])
+                            
+                            # Handle files directly in root vs subfolders
+                            if f_data['parent'] == item_info['uuid']:
+                                rel_dir = ''
+                            elif rel_dir is None:
+                                continue
+                            
+                            local_file_path = os.path.join(base_dest, rel_dir, filename)
+                            os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+                            
                             tasks.append({
-                                'remoteUuid': file_info['uuid'],
+                                'remoteUuid': f_data['uuid'],
                                 'localPath': local_file_path,
                                 'status': 'pending',
-                                'remoteModificationTime': file_info.get('lastModified', file_info.get('timestamp', 0))
+                                'remoteModificationTime': meta.get('lastModified', 0)
                             })
-                    
-                    for folder_info in folders:
-                        folder_name = folder_info['name']
-                        next_rel_path = os.path.join(current_rel_path, folder_name)
-                        local_subdir = os.path.join(base_dest, next_rel_path)
-                        os.makedirs(local_subdir, exist_ok=True)
-                        
-                        build_tasks(folder_info['uuid'], next_rel_path)
-                
-                build_tasks(item_info['uuid'], '')
-                
+                        except Exception as e:
+                            # Only log detail errors in debug mode
+                            if self.debug: self._log(f"⚠️ File processing error ({f_data.get('uuid')}): {e}")
+                            continue
+
+                except Exception as e:
+                    print(f"❌ Failed to fetch folder tree: {e}")
+                    raise
+
                 batch_state = {
                     'operationType': 'download',
                     'remotePath': remote_path,
                     'localDestination': base_dest,
                     'tasks': tasks
                 }
-                
-                if save_state_callback:
-                    save_state_callback(batch_state)
+                if save_state_callback: save_state_callback(batch_state)
                 
                 print(f"📝 Task list: {len(tasks)} files")
+                self._log(f"Tasks prepared: {len(tasks)}")
             
-            # Process tasks
+            # Counters
             success_count = 0
             skipped_count = 0
             error_count = 0
             completed_previously = 0
             
-            # --- MODIFIED: TQDM Progress Bar Wrapper ---
-            with tqdm(total=len(tasks), unit="file", desc="Downloading", disable=None) as pbar:
+            completed_start = sum(1 for t in tasks if t['status'] == 'completed')
+            self._log(f"Starting download loop. Completed previously: {completed_start}")
+
+            with tqdm(total=len(tasks), initial=completed_start, unit="file", desc="Downloading", disable=None) as pbar:
                 for i, task in enumerate(tasks):
                     remote_uuid = task['remoteUuid']
                     local_path = task['localPath']
                     status = task['status']
                     remote_mod_time = task.get('remoteModificationTime')
                     
-                    # Update progress description
                     filename = os.path.basename(local_path)
                     pbar.set_description(f"Down: {filename[:20]:<20}")
 
                     if status == 'completed':
                         completed_previously += 1
-                        pbar.update(1)
                         continue
+                    
                     if status.startswith('skipped'):
                         skipped_count += 1
                         pbar.update(1)
                         continue
                     
-                    # Check conflict
+                    # Check Conflict
                     if os.path.exists(local_path):
                         if on_conflict == 'skip':
-                            if self.debug: print(f"⏭️  Skipping: {os.path.basename(local_path)} (exists)")
+                            if self.debug: print(f"⏭️  Skipping: {filename} (exists)")
                             skipped_count += 1
                             task['status'] = 'skipped_conflict'
-                            if save_state_callback:
-                                save_state_callback(batch_state)
+                            if save_state_callback: save_state_callback(batch_state)
                             pbar.update(1)
                             continue
                         elif on_conflict == 'newer':
                             if remote_mod_time:
                                 local_mod_time = int(os.path.getmtime(local_path) * 1000)
-                                
                                 if remote_mod_time <= local_mod_time:
-                                    if self.debug: print(f"⏭️  Skipping: {os.path.basename(local_path)} (local is newer)")
+                                    if self.debug: print(f"⏭️  Skipping: {filename} (local is newer)")
                                     skipped_count += 1
                                     task['status'] = 'skipped_newer'
-                                    if save_state_callback:
-                                        save_state_callback(batch_state)
+                                    if save_state_callback: save_state_callback(batch_state)
                                     pbar.update(1)
                                     continue
-                                if self.debug: print(f"📥 Downloading: {os.path.basename(local_path)} (remote is newer)")
+                                if self.debug: print(f"📥 Downloading: {filename} (remote is newer)")
                     
+                    # Download
                     try:
-                        if self.debug:
-                            if on_conflict != 'newer':
-                                print(f"📥 Downloading: {os.path.basename(local_path)}")
+                        if self.debug and on_conflict != 'newer':
+                            print(f"📥 Downloading: {filename}")
                         
-                        # Use quiet=True to avoid printing individual lines in batch
                         result = self.download_file(remote_uuid, save_path=local_path, quiet=True)
                         
-                        # Set timestamp
                         mod_time = result.get('lastModified') or remote_mod_time
                         if preserve_timestamps and mod_time:
                             try:
@@ -1281,7 +1337,6 @@ class DriveService:
                     
                     pbar.update(1)
             
-            # Summary
             print("\n" + "=" * 40)
             print("📊 Download Summary:")
             if completed_previously > 0:
