@@ -56,6 +56,8 @@ WebDAV Examples:
                           help='Enable verbose debug output')
         parser.add_argument('-f', '--force', action='store_true',
                           help='Force overwrite / ignore conflicts')
+        parser.add_argument('--json', action='store_true', dest='json_out',
+                          help='Emit machine-readable JSON output (whoami / ls / resolve / trash)')
         
         # Subcommands
         subparsers = parser.add_subparsers(dest='command', help='Commands')
@@ -66,7 +68,9 @@ WebDAV Examples:
         
         subparsers.add_parser('login', help='Login to account')
         subparsers.add_parser('logout', help='Logout and clear credentials')
-        subparsers.add_parser('whoami', help='Show current user')
+        whoami_parser = subparsers.add_parser('whoami', help='Show current user')
+        whoami_parser.add_argument('--json', action='store_true', dest='json_out',
+                                   help='Emit machine-readable JSON output')
         
         # ========================================================================
         # File Operations
@@ -79,6 +83,8 @@ WebDAV Examples:
         ls_parser.add_argument('--uuids', action='store_true', help='Show full UUIDs')
         ls_parser.add_argument('--include', action='append', help='Include file pattern')
         ls_parser.add_argument('--exclude', action='append', help='Exclude file pattern')
+        ls_parser.add_argument('--json', action='store_true', dest='json_out',
+                               help='Emit machine-readable JSON output')
         
         # Make directory
         mkdir_parser = subparsers.add_parser('mkdir', help='Create folder(s)')
@@ -140,6 +146,8 @@ WebDAV Examples:
         trash_parser.add_argument('--include', action='append', help='Include pattern')
         trash_parser.add_argument('--exclude', action='append', help='Exclude pattern')
         trash_parser.add_argument('-r', '--recursive', action='store_true', help='Allow deleting folders via wildcard')
+        trash_parser.add_argument('--json', action='store_true', dest='json_out',
+                                  help='Emit machine-readable JSON output')
         
         # Delete
         delete_parser = subparsers.add_parser('delete-path', help='Permanently delete')
@@ -171,6 +179,8 @@ WebDAV Examples:
         # Resolve
         resolve_parser = subparsers.add_parser('resolve', help='Debug path resolution')
         resolve_parser.add_argument('path', help='Path to resolve')
+        resolve_parser.add_argument('--json', action='store_true', dest='json_out',
+                                    help='Emit machine-readable JSON output')
         
         # Search
         search_parser = subparsers.add_parser('search', help='Server-side search')
@@ -259,6 +269,7 @@ WebDAV Examples:
         # Set debug/force mode
         self.debug = parsed.verbose
         self.force = parsed.force
+        self.json_out = bool(getattr(parsed, 'json_out', False))
         self.drive.debug = self.debug
         self.auth.api.debug = self.debug
         
@@ -437,12 +448,29 @@ WebDAV Examples:
         """Handle whoami command - IMPROVED"""
         try:
             info = self.auth.whoami()
-            
+
             if not info:
+                if getattr(self, 'json_out', False):
+                    import json as _json, sys as _sys
+                    _sys.stdout.write(_json.dumps({"logged_in": False, "user": None}) + "\n")
+                    return 1
                 print("❌ Not logged in")
                 print("💡 Run 'filen login' to authenticate")
                 return 1
-            
+
+            if getattr(self, 'json_out', False):
+                import json as _json, sys as _sys
+                payload = {
+                    "logged_in": True,
+                    "user": {
+                        "email": info.get('email'),
+                        "userId": info.get('userId'),
+                        "rootFolderId": info.get('rootFolderId'),
+                    },
+                }
+                _sys.stdout.write(_json.dumps(payload) + "\n")
+                return 0
+
             print("╔════════════════════════════════════════╗")
             print("║         User Information               ║")
             print("╚════════════════════════════════════════╝")
@@ -467,6 +495,10 @@ WebDAV Examples:
             return 0
         
         except Exception as e:
+            if getattr(self, 'json_out', False):
+                import json as _json, sys as _sys
+                _sys.stderr.write(_json.dumps({"error": str(e)}) + "\n")
+                return 1
             print(f"❌ Error: {e}")
             if self.debug:
                 import traceback
@@ -583,29 +615,42 @@ WebDAV Examples:
         """Handle list command with wildcards and filtering"""
         try:
             self._prepare_client()
-            
+
             # 1. Expand path/pattern
             # If args.path looks like a glob (contains *?[), expand it
             # Otherwise treat as a folder list unless it's a file
             import fnmatch
             path_arg = args.path
-            
+
             is_pattern = any(char in path_arg for char in ['*', '?', '['])
-            
+
             # Get filters
             include = getattr(args, 'include', []) or []
             exclude = getattr(args, 'exclude', []) or []
-            
+
+            json_out = bool(getattr(self, 'json_out', False))
+
             if is_pattern:
                 # Case A: "ls *.txt" -> List matches
                 items = self._expand_remote_path(path_arg)
                 # Apply filters
                 filtered = [i for i in items if self._should_process_item(i['name'], include, exclude)]
-                
+
+                if json_out:
+                    import json as _json, sys as _sys
+                    folders = [i for i in filtered if (i.get('type') or i.get('itemType')) == 'folder']
+                    files = [i for i in filtered if (i.get('type') or i.get('itemType')) != 'folder']
+                    _sys.stdout.write(_json.dumps({
+                        "current_path": path_arg,
+                        "folders": folders,
+                        "files": files,
+                    }) + "\n")
+                    return 0
+
                 if not filtered:
                     print(f"📭 No items found matching '{path_arg}'")
                     return 0
-                    
+
                 print(f"🔍 Found {len(filtered)} items matching '{path_arg}':\n")
                 self._print_item_list(filtered, args.detailed, args.uuids)
                 return 0
@@ -613,34 +658,69 @@ WebDAV Examples:
                 # Case B: Standard folder list "ls /Docs"
                 # Resolve strictly first
                 resolved = self.drive.resolve_path(path_arg)
-                
+
                 if resolved['type'] == 'file':
                     # Check filters for single file
                     if not self._should_process_item(resolved['metadata']['name'], include, exclude):
+                        if json_out:
+                            import json as _json, sys as _sys
+                            _sys.stdout.write(_json.dumps({"current_path": resolved['path'], "folders": [], "files": []}) + "\n")
+                            return 0
                         print("🚫 File filtered out")
+                        return 0
+                    if json_out:
+                        import json as _json, sys as _sys
+                        _sys.stdout.write(_json.dumps({
+                            "current_path": resolved['path'],
+                            "folders": [],
+                            "files": [{
+                                "type": "file",
+                                "name": resolved['metadata'].get('name'),
+                                "uuid": resolved['uuid'],
+                                "size": resolved['metadata'].get('size', 0),
+                                "lastModified": resolved['metadata'].get('lastModified', 0),
+                            }],
+                        }) + "\n")
                         return 0
                     print(f"📄 File: {resolved['metadata']['name']} ({resolved['uuid']})")
                     return 0
-                
+
                 # It's a folder, list contents
                 uuid = resolved['uuid']
-                print(f"📂 {resolved['path']} (UUID: {uuid[:8]}...)\n")
-                
-                folders = self.drive.list_folders(uuid, detailed=args.detailed)
-                files = self.drive.list_files(uuid, detailed=args.detailed)
+                # Always fetch detailed when --json so size/timestamp are present.
+                detailed_flag = True if json_out else args.detailed
+                folders = self.drive.list_folders(uuid, detailed=detailed_flag)
+                files = self.drive.list_files(uuid, detailed=detailed_flag)
                 all_items = folders + files
-                
+
                 # Filter contents
                 filtered = [i for i in all_items if self._should_process_item(i['name'], include, exclude)]
-                
+
+                if json_out:
+                    import json as _json, sys as _sys
+                    out_folders = [i for i in filtered if (i.get('type') or i.get('itemType')) == 'folder']
+                    out_files = [i for i in filtered if (i.get('type') or i.get('itemType')) != 'folder']
+                    _sys.stdout.write(_json.dumps({
+                        "current_path": resolved['path'],
+                        "folders": out_folders,
+                        "files": out_files,
+                    }) + "\n")
+                    return 0
+
+                print(f"📂 {resolved['path']} (UUID: {uuid[:8]}...)\n")
+
                 if not filtered:
                     print("   (empty or all items filtered)")
                     return 0
-                
+
                 self._print_item_list(filtered, args.detailed, args.uuids)
                 return 0
 
         except Exception as e:
+            if getattr(self, 'json_out', False):
+                import json as _json, sys as _sys
+                _sys.stderr.write(_json.dumps({"error": str(e)}) + "\n")
+                return 1
             print(f"❌ List failed: {e}")
             if self.debug:
                 import traceback
@@ -1141,6 +1221,69 @@ WebDAV Examples:
                 traceback.print_exc()
             return 1
 
+    def handle_trash(self, args) -> int:
+        """Move items to trash (recoverable). JSON output supported."""
+        json_out = bool(getattr(self, 'json_out', False))
+        try:
+            self._prepare_client()
+
+            include = getattr(args, 'include', []) or []
+            exclude = getattr(args, 'exclude', []) or []
+
+            # Resolve / expand path
+            items = self._expand_remote_path(args.path)
+            items_to_process = [i for i in items if self._should_process_item(i['name'], include, exclude)]
+
+            if not items_to_process:
+                if json_out:
+                    import json as _json, sys as _sys
+                    _sys.stderr.write(_json.dumps({"error": f"No items found matching '{args.path}'"}) + "\n")
+                    return 1
+                print(f"❌ No items found matching '{args.path}'")
+                return 1
+
+            # Block recursive folder trashing without -r unless single item is a file.
+            if not getattr(args, 'recursive', False):
+                folders = [i for i in items_to_process if i.get('type') == 'folder']
+                if folders:
+                    msg = "Pass -r to trash folders"
+                    if json_out:
+                        import json as _json, sys as _sys
+                        _sys.stderr.write(_json.dumps({"error": msg}) + "\n")
+                        return 1
+                    print(f"❌ {msg}")
+                    return 1
+
+            trashed = []
+            errors = []
+            for item in items_to_process:
+                try:
+                    self.drive.trash_item(item['uuid'], item['type'])
+                    trashed.append({"uuid": item['uuid'], "path": item.get('path'), "type": item.get('type')})
+                except Exception as e:
+                    errors.append({"path": item.get('path'), "error": str(e)})
+
+            if json_out:
+                import json as _json, sys as _sys
+                _sys.stdout.write(_json.dumps({"trashed": trashed, "errors": errors}) + "\n")
+                return 0 if not errors else 1
+
+            print(f"🗑️  Moved {len(trashed)} item(s) to trash")
+            for e in errors:
+                print(f"  ❌ {e['path']}: {e['error']}")
+            return 0 if not errors else 1
+
+        except Exception as e:
+            if json_out:
+                import json as _json, sys as _sys
+                _sys.stderr.write(_json.dumps({"error": str(e)}) + "\n")
+                return 1
+            print(f"❌ Trash failed: {e}")
+            if self.debug:
+                import traceback
+                traceback.print_exc()
+            return 1
+
     def handle_delete(self, args) -> int:
         """Handle delete-path command with wildcards"""
         try:
@@ -1600,12 +1743,25 @@ WebDAV Examples:
 
     def handle_resolve(self, args) -> int:
         """Debug command to resolve a path"""
+        json_out = bool(getattr(self, 'json_out', False))
         try:
             self._prepare_client()
-            print(f"🔍 Resolving: {args.path}")
-            
+            if not json_out:
+                print(f"🔍 Resolving: {args.path}")
+
             result = self.drive.resolve_path(args.path)
-            
+
+            if json_out:
+                import json as _json, sys as _sys
+                _sys.stdout.write(_json.dumps({
+                    "type": result.get('type'),
+                    "uuid": result.get('uuid'),
+                    "path": result.get('path'),
+                    "metadata": result.get('metadata'),
+                    "parent": result.get('parent'),
+                }) + "\n")
+                return 0
+
             print("\n✅ Found:")
             print(f"   Name: {result['metadata'].get('name')}")
             print(f"   Type: {result['type']}")
@@ -1613,11 +1769,19 @@ WebDAV Examples:
             if 'parent' in result:
                 print(f"   Parent: {result['parent']}")
             return 0
-            
+
         except FileNotFoundError:
+            if json_out:
+                import json as _json, sys as _sys
+                _sys.stderr.write(_json.dumps({"error": "Path not found"}) + "\n")
+                return 1
             print("❌ Path not found")
             return 1
         except Exception as e:
+            if json_out:
+                import json as _json, sys as _sys
+                _sys.stderr.write(_json.dumps({"error": str(e)}) + "\n")
+                return 1
             print(f"❌ Error: {e}")
             return 1
         
