@@ -1425,18 +1425,36 @@ class DriveService:
             self.api.rename_file(uuid, name_encrypted, metadata_encrypted, name_hashed)
 
     def trash_item(self, uuid: str, item_type: str) -> None:
-        """Move item to trash"""
+        """Move item to trash.
+
+        Also invalidates listing/path caches so subsequent resolve_path()
+        calls reflect the deletion.  Without this, the WebDAV provider's
+        post-delete exists() check (wsgidav request_server.py line 644)
+        would find the still-cached entry and report
+        500 'Resource could not be deleted.'
+        """
         if item_type == 'folder':
             self.api.trash_folder(uuid)
         else:
             self.api.trash_file(uuid)
+        self._invalidate_all_caches()
 
     def delete_permanent(self, uuid: str, item_type: str) -> None:
-        """Permanently delete item"""
+        """Permanently delete item (also invalidates caches — see trash_item)."""
         if item_type == 'folder':
             self.api.delete_folder_permanent(uuid)
         else:
             self.api.delete_file_permanent(uuid)
+        self._invalidate_all_caches()
+
+    def _invalidate_all_caches(self) -> None:
+        """Clear every listing/path cache.  Cheap to rebuild on next read;
+        critical for correctness when callers mutate the tree (delete /
+        move / rename) and the WebDAV provider then post-checks via exists().
+        """
+        self._folder_cache.clear()
+        self._file_cache.clear()
+        self._path_cache = {}
 
     def restore_item(self, uuid: str, item_type: str) -> None:
         """Restore item from trash"""
