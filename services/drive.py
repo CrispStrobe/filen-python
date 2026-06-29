@@ -9,7 +9,7 @@ import json
 import hashlib
 import threading
 import glob as glob_module
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Callable, Tuple, Iterator, Set
 from datetime import datetime
@@ -23,6 +23,21 @@ DEFAULT_DOWNLOAD_CONCURRENCY = 4
 # Files with this many chunks or fewer keep the simple sequential path — no
 # thread pool is spun up (the overlap win doesn't pay for tiny files).
 SEQUENTIAL_CHUNK_THRESHOLD = 2
+
+# --- Batch file-level concurrency (Step 2) ---------------------------------
+# W: whole FILES transferred at once in a batch directory upload/download — the
+# bigger real-world win when syncing many files. Each file ALSO runs Step 1
+# chunk concurrency internally, so the dangerous quantity is the PRODUCT
+# (W files × N chunks each). We cap that product with ONE shared budget across
+# the whole batch: a `threading.Semaphore` whose permits count chunks in flight.
+# Every chunk transfer (sequential OR concurrent path) acquires one permit
+# before the network call and releases it after, so total in-flight is bounded
+# regardless of how the per-file degree and W combine.
+DEFAULT_FILE_CONCURRENCY = 4
+# Total chunks allowed in flight across ALL files × their chunks. At ~2 MB live
+# per chunk (1 MB plaintext + ~1 MB encrypted) this is a ~16 MB ceiling —
+# matters on mobile (CrispCloud). The shared budget, not W, is the memory cap.
+GLOBAL_MAX_INFLIGHT_CHUNKS = 8
 
 
 def _contiguous_completed_max(completed: Set[int]) -> int:
@@ -538,6 +553,7 @@ class DriveService:
         on_chunks_completed: Optional[Callable[[Set[int]], None]] = None,
         max_concurrent_chunks: int = DEFAULT_UPLOAD_CONCURRENCY,
         file_key: Optional[str] = None,
+        global_chunk_slots: Optional[threading.Semaphore] = None,
     ) -> Dict[str, str]:
         """
         Upload file in chunks with resume support
@@ -638,12 +654,14 @@ class DriveService:
                     f, file_size, chunk_size, total_chunks, done_chunks, hasher,
                     file_key_bytes, uuid, upload_key, parent_uuid,
                     max_concurrent_chunks, on_progress, on_chunks_completed,
+                    global_chunk_slots,
                 )
             else:
                 self._upload_chunks_sequential(
                     f, file_size, chunk_size, total_chunks, done_chunks, hasher,
                     file_key_bytes, uuid, upload_key, parent_uuid,
                     on_progress, on_chunks_completed,
+                    global_chunk_slots,
                 )
 
         # Every chunk (whatever the order) is uploaded before we finalize.
@@ -718,7 +736,8 @@ class DriveService:
     def _upload_chunks_sequential(self, f, file_size, chunk_size, total_chunks,
                                   done_chunks, hasher, file_key_bytes, uuid,
                                   upload_key, parent_uuid, on_progress,
-                                  on_chunks_completed) -> Set[int]:
+                                  on_chunks_completed,
+                                  global_chunk_slots=None) -> Set[int]:
         completed: Set[int] = set(done_chunks)
         index = 0
         while True:
@@ -729,6 +748,10 @@ class DriveService:
             if index in done_chunks:
                 index += 1
                 continue
+            # Shared batch byte budget (Step 2): one permit per chunk in flight,
+            # across every file in the batch. No-op when uploading a single file.
+            if global_chunk_slots is not None:
+                global_chunk_slots.acquire()
             try:
                 self._upload_one_chunk(index, chunk, file_key_bytes, uuid,
                                        upload_key, parent_uuid)
@@ -741,6 +764,9 @@ class DriveService:
                     completed_chunks=completed, original_error=e,
                     file_key=file_key_bytes.decode('utf-8', 'ignore'),
                 )
+            finally:
+                if global_chunk_slots is not None:
+                    global_chunk_slots.release()
             completed.add(index)
             self._report_upload_progress(completed, total_chunks, chunk_size,
                                          file_size, on_progress, on_chunks_completed)
@@ -750,13 +776,14 @@ class DriveService:
     def _upload_chunks_concurrent(self, f, file_size, chunk_size, total_chunks,
                                   done_chunks, hasher, file_key_bytes, uuid,
                                   upload_key, parent_uuid, max_concurrent_chunks,
-                                  on_progress, on_chunks_completed) -> Set[int]:
+                                  on_progress, on_chunks_completed,
+                                  global_chunk_slots=None) -> Set[int]:
         completed: Set[int] = set(done_chunks)
         lock = threading.Lock()
         errors: List[Tuple[int, Exception]] = []
         # Bound chunks-in-flight to N so at most N×(plaintext+encrypted) bytes
         # are live at once. The producer blocks on this semaphore — that is the
-        # memory ceiling, independent of pool size.
+        # per-file memory ceiling, independent of pool size.
         slots = threading.Semaphore(max_concurrent_chunks)
 
         def worker(index: int, plaintext: bytes):
@@ -773,6 +800,10 @@ class DriveService:
                     errors.append((index, e))
             finally:
                 slots.release()
+                # Release the shared batch budget last so a freed slot is
+                # immediately reusable by any file in the batch.
+                if global_chunk_slots is not None:
+                    global_chunk_slots.release()
 
         with ThreadPoolExecutor(max_workers=max_concurrent_chunks) as executor:
             index = 0
@@ -787,10 +818,19 @@ class DriveService:
                 with lock:
                     if errors:
                         break
-                slots.acquire()  # memory + concurrency bound
+                # Acquire the shared batch budget BEFORE the per-file slot, in
+                # this fixed order across every file, so the in-flight chunk
+                # count never exceeds the global cap and the ordering can't
+                # deadlock. The producer thus over-reads at most one chunk per
+                # file beyond the budget.
+                if global_chunk_slots is not None:
+                    global_chunk_slots.acquire()
+                slots.acquire()  # per-file memory + concurrency bound
                 with lock:
                     if errors:
                         slots.release()
+                        if global_chunk_slots is not None:
+                            global_chunk_slots.release()
                         break
                 executor.submit(worker, index, chunk)
                 index += 1
@@ -841,10 +881,17 @@ class DriveService:
         exclude: List[str] = None,
         batch_id: Optional[str] = None,
         initial_batch_state: Optional[Dict[str, Any]] = None,
-        save_state_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+        save_state_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        max_workers: int = DEFAULT_FILE_CONCURRENCY,
     ) -> None:
         """
-        Batch upload with resume support and extensive logging
+        Batch upload with resume support and extensive logging.
+
+        `max_workers` (Step 2) is the number of whole FILES uploaded
+        concurrently. Files complete out of order, so batch-state writes are
+        serialized under a lock and the total chunks in flight across all files
+        are capped by ONE shared budget (see GLOBAL_MAX_INFLIGHT_CHUNKS). A
+        single file, or `max_workers <= 1`, stays on the sequential path.
         """
         include = include or []
         exclude = exclude or []
@@ -898,7 +945,13 @@ class DriveService:
                                         'status': 'pending',
                                         'fileUuid': None,
                                         'uploadKey': None,
-                                        'lastChunk': -1
+                                        'lastChunk': -1,
+                                        # Pre-declared so concurrent workers only
+                                        # ever UPDATE keys, never grow the dict —
+                                        # keeps a save_state_callback's json.dumps
+                                        # race-free under file-level concurrency.
+                                        'fileKey': None,
+                                        'completedChunks': []
                                     })
                                 else:
                                     self._log(f"Filtered out: {filename}")
@@ -912,7 +965,10 @@ class DriveService:
                                 'status': 'pending',
                                 'fileUuid': None,
                                 'uploadKey': None,
-                                'lastChunk': -1
+                                'lastChunk': -1,
+                                # Pre-declared (see above) for race-free saves.
+                                'fileKey': None,
+                                'completedChunks': []
                             })
                         else:
                             self._log(f"Filtered out: {item.name}")
@@ -929,175 +985,237 @@ class DriveService:
             print(f"📝 Task list: {len(tasks)} files")
             self._log(f"Task list built with {len(tasks)} items")
         
-        success_count = 0
-        skipped_count = 0
-        error_count = 0
-        completed_previously = 0
-        
         completed_count = sum(1 for t in tasks if t['status'] == 'completed')
         self._log(f"Previously completed: {completed_count}")
-        
+
+        # Step 2: number of whole FILES uploaded at once. Capped at the count of
+        # actually-pending tasks (no point spinning up idle workers) and floored
+        # at 1 — a single file, or max_workers<=1, keeps the sequential path.
+        pending = [t for t in tasks if t['status'] != 'completed']
+        effective_workers = max(1, min(max_workers, len(pending)))
+
+        # Shared, lock-guarded across files completing out of order:
+        #   state_lock    — every save_state_callback (serializes whole batch_state),
+        #   progress_lock — the tqdm bar (per-file lines must not interleave),
+        #   counts        — outcome tally (each worker reports its own token).
+        state_lock = threading.Lock()
+        progress_lock = threading.Lock()
+        counts_lock = threading.Lock()
+        counts = {'completed': 0, 'skipped': 0, 'error': 0, 'already': 0}
+
+        def _advance(token, pbar):
+            with counts_lock:
+                counts[token] += 1
+            if token != 'already':  # 'completed' previously is already counted
+                with progress_lock:
+                    pbar.update(1)
+
         with tqdm(total=len(tasks), initial=completed_count, unit="file", desc="Uploading", disable=None) as pbar:
-            for i, task in enumerate(tasks):
-                local_path = task['localPath']
-                remote_path = task['remotePath']
-                status = task['status']
-                
-                remote_filename = os.path.basename(remote_path)
-                pbar.set_description(f"Up: {remote_filename[:20]:<20}")
-
-                # Debug every 10th item or if specific status
-                if i % 10 == 0: self._log(f"Processing index {i}: {remote_filename}")
-
-                if status == 'completed':
-                    completed_previously += 1
-                    # self._log(f"Skipping completed: {remote_filename}")
-                    continue
-                
-                if status.startswith('skipped'):
-                    skipped_count += 1
-                    pbar.update(1)
-                    continue
-                
-                if not os.path.exists(local_path):
-                    if self.debug: print(f"⚠️  Source missing: {Path(local_path).name}")
-                    skipped_count += 1
-                    task['status'] = 'skipped_missing'
-                    if save_state_callback: save_state_callback(batch_state)
-                    pbar.update(1)
-                    continue
-                
-                # Resolve parent folder
-                remote_parent = os.path.dirname(remote_path).replace('\\', '/')
-                try:
-                    # self._log(f"Ensuring parent exists: {remote_parent}")
-                    parent_info = self.create_folder_recursive(remote_parent)
-                except Exception as e:
-                    if self.debug: print(f"❌ Error creating parent {remote_parent}: {e}")
-                    error_count += 1
-                    task['status'] = 'error_parent'
-                    if save_state_callback: save_state_callback(batch_state)
-                    pbar.update(1)
-                    continue
-                
-                # Check conflict
-                should_upload = True
-                if not task.get('fileUuid'):
-                    name_hashed = self.crypto.hash_filename(remote_filename, self.email, self._get_master_key())
-                    
-                    # self._log(f"Checking existence: {remote_filename} in {parent_info['uuid']}")
-                    existing_files = self.list_files(parent_info['uuid'], detailed=False)
-                    exists = any(f['name'] == remote_filename for f in existing_files)
-                    
-                    if not exists:
-                        # Fallback API check if cache empty
-                        exists = self.api.check_file_exists(parent_info['uuid'], name_hashed)
-                    
-                    if exists:
-                        if on_conflict == 'skip':
-                            if self.debug: print(f"⏭️  Skipping: {remote_filename} (exists)")
-                            skipped_count += 1
-                            task['status'] = 'skipped_conflict'
-                            if save_state_callback: save_state_callback(batch_state)
-                            pbar.update(1)
-                            should_upload = False
-                
-                if not should_upload:
-                    continue
-                
-                # Upload
-                try:
-                    file_size = os.path.getsize(local_path)
-                    # Resume state is a SET of completed indices ('completedChunks').
-                    # Legacy state files only carry 'lastChunk' (a high-water mark
-                    # written by the old sequential code) — fold it into the set.
-                    resume_completed: Set[int] = set(task.get('completedChunks') or [])
-                    if task.get('lastChunk', -1) >= 0:
-                        resume_completed |= set(range(task['lastChunk'] + 1))
-                    is_resuming = (status in ['interrupted', 'uploading']) and bool(resume_completed)
-
-                    if self.debug:
-                        if is_resuming:
-                            print(f"📤 Resuming: {remote_filename} ({format_size(file_size)})")
-                        else:
-                            print(f"📤 Uploading: {remote_filename} ({format_size(file_size)})")
-
-                    task['status'] = 'uploading'
-                    if save_state_callback: save_state_callback(batch_state)
-
-                    last_save_time = datetime.now()
-                    last_saved_count = len(resume_completed)
-                    state_lock = threading.Lock()
-
-                    def on_upload_start_handler(uuid: str, key: str, fkey: str):
-                        # self._log(f"Upload initiated: {uuid}")
-                        task['fileUuid'] = uuid
-                        task['uploadKey'] = key
-                        task['fileKey'] = fkey
-                        task['lastChunk'] = -1
-                        task['completedChunks'] = []
-                        if save_state_callback: save_state_callback(batch_state)
-
-                    def on_chunks_completed_handler(done: Set[int]):
-                        # Fired from worker threads as chunks finish (out of order).
-                        # Persist the exact set + a contiguous high-water mark
-                        # (legacy-safe), throttled to avoid hammering the state file.
-                        nonlocal last_save_time, last_saved_count
-                        with state_lock:
-                            task['completedChunks'] = sorted(done)
-                            task['lastChunk'] = _contiguous_completed_max(done)
-                            now = datetime.now()
-                            if (len(done) - last_saved_count >= 10) or (now - last_save_time).seconds >= 5:
-                                if save_state_callback: save_state_callback(batch_state)
-                                last_save_time = now
-                                last_saved_count = len(done)
-
-                    self.upload_file_chunked(
-                        local_path,
-                        parent_info['uuid'],
-                        file_uuid=task.get('fileUuid'),
-                        upload_key=task.get('uploadKey'),
-                        file_key=task.get('fileKey') if is_resuming else None,
-                        completed_chunks=resume_completed if is_resuming else None,
+            if effective_workers <= 1:
+                # Sequential path: no shared budget, no pre-creation — behaves
+                # exactly like the pre-Step-2 loop.
+                for task in tasks:
+                    fname = os.path.basename(task['remotePath'])
+                    with progress_lock:
+                        pbar.set_description(f"Up: {fname[:20]:<20}")
+                    token = self._upload_task(
+                        task, parent_map=None, on_conflict=on_conflict,
                         preserve_timestamps=preserve_timestamps,
-                        on_upload_start=on_upload_start_handler if not is_resuming else None,
-                        on_chunks_completed=on_chunks_completed_handler
+                        save_state_callback=save_state_callback,
+                        batch_state=batch_state, state_lock=state_lock,
+                        max_concurrent_chunks=DEFAULT_UPLOAD_CONCURRENCY,
+                        global_chunk_slots=None,
+                    )
+                    _advance(token, pbar)
+            else:
+                # Pre-create unique parent folders ONCE, before fan-out, so the
+                # shared create_folder_recursive + cache-invalidation side
+                # effects can't race across concurrent files (constraint 3).
+                parent_map: Dict[str, Any] = {}
+                for task in pending:
+                    rp = os.path.dirname(task['remotePath']).replace('\\', '/')
+                    if rp in parent_map:
+                        continue
+                    try:
+                        parent_map[rp] = self.create_folder_recursive(rp)
+                    except Exception as e:
+                        # Leave it unmapped; the per-task path retries and marks
+                        # error_parent — same outcome as the sequential path.
+                        self._log(f"Pre-create parent failed for {rp}: {e}")
+
+                # ONE shared byte budget across files × chunks (constraint 2):
+                # a semaphore whose permits count chunks in flight for the WHOLE
+                # batch. Per-file chunk concurrency is lowered too so no single
+                # file monopolizes the budget.
+                per_file_chunks = max(1, GLOBAL_MAX_INFLIGHT_CHUNKS // effective_workers)
+                global_chunk_slots = threading.Semaphore(GLOBAL_MAX_INFLIGHT_CHUNKS)
+
+                print(f"  🧵 Uploading {len(pending)} file(s) with {effective_workers} worker(s)")
+
+                def _run(task):
+                    return self._upload_task(
+                        task, parent_map=parent_map, on_conflict=on_conflict,
+                        preserve_timestamps=preserve_timestamps,
+                        save_state_callback=save_state_callback,
+                        batch_state=batch_state, state_lock=state_lock,
+                        max_concurrent_chunks=per_file_chunks,
+                        global_chunk_slots=global_chunk_slots,
                     )
 
-                    if self.debug:
-                        print(f"   ✅ Complete: {remote_filename}")
+                with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                    futures = [executor.submit(_run, t) for t in tasks]
+                    for fut in as_completed(futures):
+                        _advance(fut.result(), pbar)
 
-                    success_count += 1
-                    task['status'] = 'completed'
-                    task['fileUuid'] = None
-                    task['uploadKey'] = None
-                    task['lastChunk'] = -1
-                    task['completedChunks'] = []
+        success_count = counts['completed']
+        skipped_count = counts['skipped']
+        error_count = counts['error']
 
-                except ChunkUploadException as e:
-                    if self.debug: print(f"\n⚠️  Interrupted: {e.message}")
-                    task['fileUuid'] = e.file_uuid
-                    task['uploadKey'] = e.upload_key
-                    task['fileKey'] = e.file_key
-                    task['completedChunks'] = sorted(e.completed_chunks)
-                    task['lastChunk'] = e.last_successful_chunk
-                    task['status'] = 'interrupted'
-                    error_count += 1
-                    if save_state_callback: save_state_callback(batch_state)
-                    if self.debug: print("💾 State saved")
-                    
-                except Exception as e:
-                    if self.debug: print(f"\n❌ Error uploading {remote_filename}: {e}")
-                    error_count += 1
-                    task['status'] = 'error_upload'
-                
-                if save_state_callback: save_state_callback(batch_state)
-                pbar.update(1)
-        
         print("\n" + "=" * 40)
         print(f"📊 Summary: ✅ {success_count} | ⏭️ {skipped_count} | ❌ {error_count}")
         if error_count > 0:
             raise Exception(f"Upload completed with {error_count} errors")
+
+    def _upload_task(self, task, *, parent_map, on_conflict, preserve_timestamps,
+                     save_state_callback, batch_state, state_lock,
+                     max_concurrent_chunks, global_chunk_slots) -> str:
+        """Upload a single batch task; return one of 'completed', 'skipped',
+        'error', 'already'.
+
+        Safe to run from a worker thread: it mutates only its own `task` dict,
+        and every save_state_callback (which serializes the whole shared
+        `batch_state`) is guarded by the shared `state_lock`. The shared
+        `global_chunk_slots` budget caps total chunks in flight across the batch.
+        """
+        def save():
+            if save_state_callback:
+                with state_lock:
+                    save_state_callback(batch_state)
+
+        local_path = task['localPath']
+        remote_path = task['remotePath']
+        status = task['status']
+        remote_filename = os.path.basename(remote_path)
+
+        if status == 'completed':
+            return 'already'
+        if status.startswith('skipped'):
+            return 'skipped'
+
+        if not os.path.exists(local_path):
+            if self.debug: print(f"⚠️  Source missing: {Path(local_path).name}")
+            task['status'] = 'skipped_missing'
+            save()
+            return 'skipped'
+
+        # Parent folder: pre-created before fan-out (parent_map) in the
+        # concurrent path; created on demand for the sequential path.
+        remote_parent = os.path.dirname(remote_path).replace('\\', '/')
+        parent_info = parent_map.get(remote_parent) if parent_map else None
+        if parent_info is None:
+            try:
+                parent_info = self.create_folder_recursive(remote_parent)
+            except Exception as e:
+                if self.debug: print(f"❌ Error creating parent {remote_parent}: {e}")
+                task['status'] = 'error_parent'
+                save()
+                return 'error'
+
+        # Conflict check (reads only — safe to run concurrently)
+        if not task.get('fileUuid'):
+            name_hashed = self.crypto.hash_filename(remote_filename, self.email, self._get_master_key())
+            existing_files = self.list_files(parent_info['uuid'], detailed=False)
+            exists = any(f['name'] == remote_filename for f in existing_files)
+            if not exists:
+                exists = self.api.check_file_exists(parent_info['uuid'], name_hashed)
+            if exists and on_conflict == 'skip':
+                if self.debug: print(f"⏭️  Skipping: {remote_filename} (exists)")
+                task['status'] = 'skipped_conflict'
+                save()
+                return 'skipped'
+
+        try:
+            file_size = os.path.getsize(local_path)
+            # Resume state is a SET of completed indices ('completedChunks').
+            # Legacy state carries only 'lastChunk' (a high-water mark) — fold
+            # it into the set.
+            resume_completed: Set[int] = set(task.get('completedChunks') or [])
+            if task.get('lastChunk', -1) >= 0:
+                resume_completed |= set(range(task['lastChunk'] + 1))
+            is_resuming = (status in ['interrupted', 'uploading']) and bool(resume_completed)
+
+            if self.debug:
+                verb = "Resuming" if is_resuming else "Uploading"
+                print(f"📤 {verb}: {remote_filename} ({format_size(file_size)})")
+
+            task['status'] = 'uploading'
+            save()
+
+            # Throttle bookkeeping for the chunk-completion callback (this
+            # file's chunk workers); guarded by the shared state_lock.
+            last_save = {'time': datetime.now(), 'count': len(resume_completed)}
+
+            def on_upload_start_handler(uuid: str, key: str, fkey: str):
+                task['fileUuid'] = uuid
+                task['uploadKey'] = key
+                task['fileKey'] = fkey
+                task['lastChunk'] = -1
+                task['completedChunks'] = []
+                save()
+
+            def on_chunks_completed_handler(done: Set[int]):
+                # Fired from chunk-worker threads (out of order). The shared
+                # state_lock guards both the throttle state and the write.
+                with state_lock:
+                    task['completedChunks'] = sorted(done)
+                    task['lastChunk'] = _contiguous_completed_max(done)
+                    now = datetime.now()
+                    if (len(done) - last_save['count'] >= 10) or (now - last_save['time']).seconds >= 5:
+                        if save_state_callback:
+                            save_state_callback(batch_state)
+                        last_save['time'] = now
+                        last_save['count'] = len(done)
+
+            self.upload_file_chunked(
+                local_path,
+                parent_info['uuid'],
+                file_uuid=task.get('fileUuid'),
+                upload_key=task.get('uploadKey'),
+                file_key=task.get('fileKey') if is_resuming else None,
+                completed_chunks=resume_completed if is_resuming else None,
+                preserve_timestamps=preserve_timestamps,
+                on_upload_start=on_upload_start_handler if not is_resuming else None,
+                on_chunks_completed=on_chunks_completed_handler,
+                max_concurrent_chunks=max_concurrent_chunks,
+                global_chunk_slots=global_chunk_slots,
+            )
+
+            if self.debug:
+                print(f"   ✅ Complete: {remote_filename}")
+            task['status'] = 'completed'
+            task['fileUuid'] = None
+            task['uploadKey'] = None
+            task['lastChunk'] = -1
+            task['completedChunks'] = []
+            save()
+            return 'completed'
+
+        except ChunkUploadException as e:
+            if self.debug: print(f"\n⚠️  Interrupted: {e.message}")
+            task['fileUuid'] = e.file_uuid
+            task['uploadKey'] = e.upload_key
+            task['fileKey'] = e.file_key
+            task['completedChunks'] = sorted(e.completed_chunks)
+            task['lastChunk'] = e.last_successful_chunk
+            task['status'] = 'interrupted'
+            save()
+            return 'error'
+
+        except Exception as e:
+            if self.debug: print(f"\n❌ Error uploading {remote_filename}: {e}")
+            task['status'] = 'error_upload'
+            save()
+            return 'error'
 
     # ============================================================================
     # FILE DOWNLOAD
@@ -1106,9 +1224,14 @@ class DriveService:
     def download_file(self, file_uuid: str, save_path: Optional[str] = None,
                      on_progress: Optional[Callable[[int, int], None]] = None,
                      quiet: bool = False,
-                     max_concurrent_chunks: int = DEFAULT_DOWNLOAD_CONCURRENCY) -> Dict[str, Any]:
+                     max_concurrent_chunks: int = DEFAULT_DOWNLOAD_CONCURRENCY,
+                     global_chunk_slots: Optional[threading.Semaphore] = None) -> Dict[str, Any]:
         """
-        Download file from Filen
+        Download file from Filen.
+
+        `global_chunk_slots` (Step 2) is the shared batch byte budget: when set,
+        every chunk fetched — sequential or concurrent path — takes one permit,
+        so total chunks in flight across all files in a batch stay bounded.
         """
         
         self._log(f"Downloading file: {file_uuid}")
@@ -1156,13 +1279,21 @@ class DriveService:
             self._download_chunks_concurrent(
                 target_path, file_uuid, region, bucket, chunks, file_key_bytes,
                 int(file_size or 0), max_concurrent_chunks, on_progress,
+                global_chunk_slots,
             )
         else:
             bytes_downloaded = 0
             with open(target_path, 'wb') as f:
                 for i in range(chunks):
-                    decrypted = self._download_one_chunk(
-                        file_uuid, region, bucket, i, file_key_bytes)
+                    # Shared batch byte budget (Step 2): one permit per chunk.
+                    if global_chunk_slots is not None:
+                        global_chunk_slots.acquire()
+                    try:
+                        decrypted = self._download_one_chunk(
+                            file_uuid, region, bucket, i, file_key_bytes)
+                    finally:
+                        if global_chunk_slots is not None:
+                            global_chunk_slots.release()
                     f.write(decrypted)
                     bytes_downloaded += len(decrypted)
                     if on_progress:
@@ -1190,7 +1321,8 @@ class DriveService:
 
     def _download_chunks_concurrent(self, target_path, file_uuid, region, bucket,
                                     chunks, file_key_bytes, file_size,
-                                    max_concurrent_chunks, on_progress) -> None:
+                                    max_concurrent_chunks, on_progress,
+                                    global_chunk_slots=None) -> None:
         plaintext = self._DOWNLOAD_CHUNK_PLAINTEXT
         lock = threading.Lock()
         errors: List[Tuple[int, Exception]] = []
@@ -1204,6 +1336,10 @@ class DriveService:
             def worker(i: int):
                 if errors:  # fail fast — stop fetching once something broke
                     return
+                # Shared batch byte budget (Step 2): one permit per chunk in
+                # flight, across every file in the batch. No-op for a lone file.
+                if global_chunk_slots is not None:
+                    global_chunk_slots.acquire()
                 try:
                     decrypted = self._download_one_chunk(
                         file_uuid, region, bucket, i, file_key_bytes)
@@ -1217,6 +1353,9 @@ class DriveService:
                 except Exception as e:  # noqa: BLE001 — surfaced after join
                     with lock:
                         errors.append((i, e))
+                finally:
+                    if global_chunk_slots is not None:
+                        global_chunk_slots.release()
 
             # ThreadPoolExecutor bounds in-flight (and thus decrypted bytes in
             # memory) to max_workers — at most N×~1 MB live at once.
@@ -1242,10 +1381,17 @@ class DriveService:
         exclude: List[str] = None,
         batch_id: Optional[str] = None,
         initial_batch_state: Optional[Dict[str, Any]] = None,
-        save_state_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+        save_state_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        max_workers: int = DEFAULT_FILE_CONCURRENCY
     ) -> None:
         """
-        Batch download with resume support and FAST tree retrieval (Handles list/dict responses)
+        Batch download with resume support and FAST tree retrieval (Handles list/dict responses).
+
+        `max_workers` (Step 2) is the number of whole FILES downloaded
+        concurrently. Files complete out of order, so batch-state writes are
+        serialized under a lock and total chunks in flight across all files are
+        capped by ONE shared budget (GLOBAL_MAX_INFLIGHT_CHUNKS). A single file,
+        or `max_workers <= 1`, stays on the sequential path.
         """
         include = include or []
         exclude = exclude or []
@@ -1467,83 +1613,65 @@ class DriveService:
                 print(f"📝 Task list: {len(tasks)} files")
                 self._log(f"Tasks prepared: {len(tasks)}")
             
-            # Counters
-            success_count = 0
-            skipped_count = 0
-            error_count = 0
-            completed_previously = 0
-            
             completed_start = sum(1 for t in tasks if t['status'] == 'completed')
             self._log(f"Starting download loop. Completed previously: {completed_start}")
 
-            with tqdm(total=len(tasks), initial=completed_start, unit="file", desc="Downloading", disable=None) as pbar:
-                for i, task in enumerate(tasks):
-                    remote_uuid = task['remoteUuid']
-                    local_path = task['localPath']
-                    status = task['status']
-                    remote_mod_time = task.get('remoteModificationTime')
-                    
-                    filename = os.path.basename(local_path)
-                    pbar.set_description(f"Down: {filename[:20]:<20}")
+            # Step 2: whole FILES downloaded at once. Capped at pending count and
+            # floored at 1 (single file / max_workers<=1 → sequential path).
+            pending = [t for t in tasks if t['status'] != 'completed']
+            effective_workers = max(1, min(max_workers, len(pending)))
 
-                    if status == 'completed':
-                        completed_previously += 1
-                        continue
-                    
-                    if status.startswith('skipped'):
-                        skipped_count += 1
+            # Shared across files completing out of order (see upload()).
+            state_lock = threading.Lock()
+            progress_lock = threading.Lock()
+            counts_lock = threading.Lock()
+            counts = {'completed': 0, 'skipped': 0, 'error': 0, 'already': 0}
+
+            def _advance(token, pbar):
+                with counts_lock:
+                    counts[token] += 1
+                if token != 'already':
+                    with progress_lock:
                         pbar.update(1)
-                        continue
-                    
-                    # Check Conflict
-                    if os.path.exists(local_path):
-                        if on_conflict == 'skip':
-                            if self.debug: print(f"⏭️  Skipping: {filename} (exists)")
-                            skipped_count += 1
-                            task['status'] = 'skipped_conflict'
-                            if save_state_callback: save_state_callback(batch_state)
-                            pbar.update(1)
-                            continue
-                        elif on_conflict == 'newer':
-                            if remote_mod_time:
-                                local_mod_time = int(os.path.getmtime(local_path) * 1000)
-                                if remote_mod_time <= local_mod_time:
-                                    if self.debug: print(f"⏭️  Skipping: {filename} (local is newer)")
-                                    skipped_count += 1
-                                    task['status'] = 'skipped_newer'
-                                    if save_state_callback: save_state_callback(batch_state)
-                                    pbar.update(1)
-                                    continue
-                                if self.debug: print(f"📥 Downloading: {filename} (remote is newer)")
-                    
-                    # Download
-                    try:
-                        if self.debug and on_conflict != 'newer':
-                            print(f"📥 Downloading: {filename}")
-                        
-                        result = self.download_file(remote_uuid, save_path=local_path, quiet=True)
-                        
-                        mod_time = result.get('lastModified') or remote_mod_time
-                        if preserve_timestamps and mod_time:
-                            try:
-                                mod_time_sec = mod_time / 1000.0
-                                os.utime(local_path, (mod_time_sec, mod_time_sec))
-                            except Exception as e:
-                                self._log(f"Could not set timestamp: {e}")
-                        
-                        success_count += 1
-                        task['status'] = 'completed'
-                        
-                    except Exception as e:
-                        if self.debug: print(f"❌ Download error: {e}")
-                        error_count += 1
-                        task['status'] = 'error_download'
-                    
-                    if save_state_callback:
-                        save_state_callback(batch_state)
-                    
-                    pbar.update(1)
-            
+
+            with tqdm(total=len(tasks), initial=completed_start, unit="file", desc="Downloading", disable=None) as pbar:
+                if effective_workers <= 1:
+                    for task in tasks:
+                        fname = os.path.basename(task['localPath'])
+                        with progress_lock:
+                            pbar.set_description(f"Down: {fname[:20]:<20}")
+                        token = self._download_task(
+                            task, on_conflict=on_conflict,
+                            preserve_timestamps=preserve_timestamps,
+                            save_state_callback=save_state_callback,
+                            batch_state=batch_state, state_lock=state_lock,
+                            global_chunk_slots=None,
+                        )
+                        _advance(token, pbar)
+                else:
+                    # ONE shared byte budget across files × chunks (constraint 2).
+                    global_chunk_slots = threading.Semaphore(GLOBAL_MAX_INFLIGHT_CHUNKS)
+                    print(f"  🧵 Downloading {len(pending)} file(s) with {effective_workers} worker(s)")
+
+                    def _run(task):
+                        return self._download_task(
+                            task, on_conflict=on_conflict,
+                            preserve_timestamps=preserve_timestamps,
+                            save_state_callback=save_state_callback,
+                            batch_state=batch_state, state_lock=state_lock,
+                            global_chunk_slots=global_chunk_slots,
+                        )
+
+                    with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                        futures = [executor.submit(_run, t) for t in tasks]
+                        for fut in as_completed(futures):
+                            _advance(fut.result(), pbar)
+
+            success_count = counts['completed']
+            skipped_count = counts['skipped']
+            error_count = counts['error']
+            completed_previously = counts['already']
+
             print("\n" + "=" * 40)
             print("📊 Download Summary:")
             if completed_previously > 0:
@@ -1555,6 +1683,75 @@ class DriveService:
             
             if error_count > 0:
                 raise Exception(f"Download completed with {error_count} errors")
+
+    def _download_task(self, task, *, on_conflict, preserve_timestamps,
+                       save_state_callback, batch_state, state_lock,
+                       global_chunk_slots) -> str:
+        """Download a single batch task; return 'completed', 'skipped',
+        'error', or 'already'.
+
+        Safe to run from a worker thread: it writes only its own local file +
+        `task` dict, and every save_state_callback (which serializes the shared
+        `batch_state`) is guarded by `state_lock`. The shared `global_chunk_slots`
+        budget caps total chunks in flight across the batch.
+        """
+        def save():
+            if save_state_callback:
+                with state_lock:
+                    save_state_callback(batch_state)
+
+        remote_uuid = task['remoteUuid']
+        local_path = task['localPath']
+        status = task['status']
+        remote_mod_time = task.get('remoteModificationTime')
+        filename = os.path.basename(local_path)
+
+        if status == 'completed':
+            return 'already'
+        if status.startswith('skipped'):
+            return 'skipped'
+
+        # Conflict check (filesystem reads — safe concurrently)
+        if os.path.exists(local_path):
+            if on_conflict == 'skip':
+                if self.debug: print(f"⏭️  Skipping: {filename} (exists)")
+                task['status'] = 'skipped_conflict'
+                save()
+                return 'skipped'
+            elif on_conflict == 'newer':
+                if remote_mod_time:
+                    local_mod_time = int(os.path.getmtime(local_path) * 1000)
+                    if remote_mod_time <= local_mod_time:
+                        if self.debug: print(f"⏭️  Skipping: {filename} (local is newer)")
+                        task['status'] = 'skipped_newer'
+                        save()
+                        return 'skipped'
+                    if self.debug: print(f"📥 Downloading: {filename} (remote is newer)")
+
+        try:
+            if self.debug and on_conflict != 'newer':
+                print(f"📥 Downloading: {filename}")
+
+            result = self.download_file(remote_uuid, save_path=local_path,
+                                        quiet=True, global_chunk_slots=global_chunk_slots)
+
+            mod_time = result.get('lastModified') or remote_mod_time
+            if preserve_timestamps and mod_time:
+                try:
+                    mod_time_sec = mod_time / 1000.0
+                    os.utime(local_path, (mod_time_sec, mod_time_sec))
+                except Exception as e:
+                    self._log(f"Could not set timestamp: {e}")
+
+            task['status'] = 'completed'
+            save()
+            return 'completed'
+
+        except Exception as e:
+            if self.debug: print(f"❌ Download error: {e}")
+            task['status'] = 'error_download'
+            save()
+            return 'error'
 
     # ============================================================================
     # OTHER FILE OPERATIONS

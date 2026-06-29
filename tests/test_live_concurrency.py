@@ -19,6 +19,7 @@ Run from the repo root:
 
 import os
 import sys
+import json
 import time
 import hashlib
 import tempfile
@@ -189,6 +190,107 @@ class LiveConcurrencyTest(unittest.TestCase):
         for name, h in expected.items():
             self.assertIn(name, got, f"{name} missing from download")
             self.assertEqual(got[name], h, f"{name} content mismatch")
+
+    # --- Step 2: file-level (batch) concurrency ----------------------------
+
+    def _make_dir(self, name, n_files, nbytes):
+        d = os.path.join(self.tmpdir, name)
+        os.makedirs(d, exist_ok=True)
+        hashes = {}
+        for i in range(n_files):
+            fn = f"f{i:02d}.bin"
+            content = os.urandom(nbytes)
+            with open(os.path.join(d, fn), "wb") as f:
+                f.write(content)
+            hashes[fn] = hashlib.sha512(content).hexdigest().lower()
+        return d, hashes
+
+    def test_batch_concurrent_is_faster_than_sequential(self):
+        # Many smallish files: per-file connection/finalize overhead dominates,
+        # so overlapping whole files should clearly beat the W=1 baseline.
+        src, _ = self._make_dir("speed_batch", 16, 256 * 1024)
+
+        t0 = time.monotonic()
+        self.drive.upload([src], f"{self.folder_path}/batch_seq",
+                          recursive=True, on_conflict="overwrite", max_workers=1)
+        seq_time = time.monotonic() - t0
+
+        t0 = time.monotonic()
+        self.drive.upload([src], f"{self.folder_path}/batch_par",
+                          recursive=True, on_conflict="overwrite", max_workers=6)
+        par_time = time.monotonic() - t0
+
+        print(f"\n[batch throughput] sequential={seq_time:.2f}s  "
+              f"concurrent(6)={par_time:.2f}s  speedup={seq_time / par_time:.2f}x")
+        self.assertLess(par_time, seq_time,
+                        "concurrent batch upload should beat the sequential baseline")
+
+    def test_interrupted_batch_resumes_with_concurrent_files(self):
+        # A directory of multi-chunk files uploaded concurrently; one chunk POST
+        # fails mid-flight, interrupting a file. Resuming the batch (with several
+        # files still in flight) must complete and round-trip byte-exact.
+        src, hashes = self._make_dir("resume_batch", 5, 3 * MB + 7)  # 4 chunks each
+        remote_dir = f"{self.folder_path}/resume_batch_up"
+
+        state_holder = {"state": None}
+
+        def save_state(state):
+            state_holder["state"] = json.loads(json.dumps(state))  # deep snapshot
+
+        real_post = self.drive.api.session.post
+        calls = {"n": 0}
+        lock = __import__("threading").Lock()
+
+        def flaky(url=None, *args, **kwargs):
+            # Only sabotage a real CHUNK upload (its URL carries index=N); folder
+            # creation / existence-check POSTs must succeed, else the batch never
+            # gets far enough to interrupt a file mid-transfer.
+            is_chunk = isinstance(url, str) and "index=" in url
+            with lock:
+                if is_chunk:
+                    calls["n"] += 1
+                    should_fail = calls["n"] == 3  # fail one chunk, mid-batch
+                else:
+                    should_fail = False
+            if should_fail:
+                raise ConnectionError("simulated mid-batch chunk failure")
+            return real_post(url, *args, **kwargs)
+
+        self.drive.api.session.post = flaky
+        try:
+            with self.assertRaises(Exception):
+                self.drive.upload([src], remote_dir, recursive=True,
+                                  on_conflict="overwrite", max_workers=4,
+                                  save_state_callback=save_state)
+        finally:
+            self.drive.api.session.post = real_post
+
+        self.assertIsNotNone(state_holder["state"], "state must have been persisted")
+        # At least one task should be mid-flight (interrupted) — proving resume
+        # is exercised, not just a clean re-run.
+        statuses = [t["status"] for t in state_holder["state"]["tasks"]]
+        self.assertTrue(any(s in ("interrupted", "error_upload") for s in statuses),
+                        f"expected an interrupted task, got {statuses}")
+
+        # Resume the batch with concurrency.
+        self.drive.upload([src], remote_dir, recursive=True, on_conflict="skip",
+                          max_workers=4,
+                          initial_batch_state=state_holder["state"],
+                          save_state_callback=save_state)
+
+        # All files present and byte-exact after download.
+        dest = os.path.join(self.tmpdir, "resume_batch_down")
+        os.makedirs(dest, exist_ok=True)
+        self.drive.download_path(f"{remote_dir}/resume_batch", dest,
+                                 recursive=True, max_workers=4)
+        got = {}
+        for root, _dirs, files in os.walk(dest):
+            for fn in files:
+                with open(os.path.join(root, fn), "rb") as f:
+                    got[fn] = hashlib.sha512(f.read()).hexdigest().lower()
+        for name, h in hashes.items():
+            self.assertIn(name, got, f"{name} missing after resume")
+            self.assertEqual(got[name], h, f"{name} content mismatch after resume")
 
 
 if __name__ == "__main__":

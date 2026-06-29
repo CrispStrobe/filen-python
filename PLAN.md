@@ -434,36 +434,31 @@ Goal: N chunks in flight (start N=4–8), **semaphore-bounded** — never unboun
 
 Skip concurrency for **tiny files** (≤ a few chunks) — branch on size.
 
-## Step 2 — file-level concurrency ⬜ TODO (sync / many small files)
+## Step 2 — file-level concurrency ✅ DONE & TESTED
 Parallelize whole FILES (not just chunks) in batch directory upload/download — the
-bigger real-world win when syncing many files. Reference: internxt-cli already does
-this (`cli.py` `ThreadPoolExecutor` + `--workers`, gated by
-`DriveService._mem_acquire`/`_mem_release`) — port that pattern.
+bigger real-world win when syncing many files. Ported internxt-cli's
+`ThreadPoolExecutor` + `--workers` worker pattern.
 
-Files/functions:
-- `services/drive.py` → `upload(...)` (~line 833): the per-file `for task in tasks:`
-  loop. Run the per-file body on a `ThreadPoolExecutor(max_workers=W)` (W configurable,
-  default 4). Each file ALSO uses Step 1 chunk concurrency internally, so cap the
-  PRODUCT: total in-flight ≈ W files × N chunks. Either lower per-file
-  `max_concurrent_chunks` when W>1, or share ONE global byte-budget semaphore across
-  all files (preferred — mirrors filen-dart's single shared `MemoryGate`, below).
-- `services/drive.py` → `download_path(...)` (~line 1024): same treatment for the
-  per-file download loop.
-
-CONSTRAINTS:
-1. `batch_state` / `save_state_callback` is shared mutable state — guard task-status
-   writes with a `threading.Lock` (files complete out of order).
-2. Cap TOTAL bytes in flight across files × chunks (ONE shared budget), not per file —
-   else W×N×2 MB blows memory on mobile (CrispCloud).
-3. Conflict-check + `create_folder_recursive` / `_invalidate_cache` are shared — lock,
-   or pre-resolve parent folders once before fan-out.
-4. Keep progress output readable under concurrency (per-file lines interleave — lock
-   prints or give each worker a tqdm position).
-
-Tests (mirror `tests/test_chunk_concurrency.py` + `tests/test_live_concurrency.py`):
-Unit: a many-file batch never exceeds W concurrent files AND the global byte budget;
-state writes are race-free. Live: a directory of many files round-trips and is faster
-than the W=1 baseline.
+- `services/drive.py` → `upload(...)`: the per-file body is now `_upload_task` (returns
+  a 'completed'/'skipped'/'error'/'already' token). For `max_workers > 1` and >1 pending
+  file it runs on a `ThreadPoolExecutor(max_workers=W)` (default 4); a single file or
+  `max_workers <= 1` keeps the sequential path. `download_path(...)` got the same
+  treatment via `_download_task`.
+- **Shared budget (constraint 2):** ONE `threading.Semaphore(GLOBAL_MAX_INFLIGHT_CHUNKS)`
+  (=8, ~16 MB) is passed into every per-file transfer as `global_chunk_slots`. Every
+  chunk POST/GET — sequential AND concurrent path — takes one permit, so the PRODUCT
+  (W files × N chunks) is hard-bounded regardless of how W and the per-file degree
+  combine. Per-file `max_concurrent_chunks` is also lowered to `GLOBAL // W`.
+- **Race-free state (constraint 1):** `save_state_callback` is serialized under a shared
+  `threading.Lock`; task templates pre-declare every key (`fileKey`, `completedChunks`)
+  so concurrent workers only UPDATE keys, never resize a dict mid-`json.dumps`.
+- **Shared side effects (constraint 3):** unique parent folders are pre-created ONCE
+  before fan-out (`create_folder_recursive` + `_invalidate_cache` no longer race);
+  conflict checks are reads only.
+- **Progress (constraint 4):** a single running counter line under a `progress_lock`.
+- Tests: `tests/test_file_concurrency.py` (8 unit) + `tests/test_live_concurrency.py`
+  (2 new live: batch faster-than-W=1, interrupted-batch resume). Live batch upload
+  measured **~3.1× faster** than the W=1 baseline on 16 files. ruff clean.
 
 ## Test matrix — unit + live for everything
 Unit (hermetic; mocked session / MockClient):
@@ -479,6 +474,19 @@ Live (real backend, saved `~/.filen-cli` session):
 - [x] interrupted upload resumes and completes (kill mid-way, restart)
 - [x] concurrent throughput sanity (large file faster than sequential baseline)
 - [x] directory of many small files round-trips
+
+## Step 2 test matrix (file-level concurrency)
+Unit (`tests/test_file_concurrency.py`, hermetic / mocked session):
+- [x] batch never exceeds W concurrent files (observed peak ≤ W)
+- [x] batch never exceeds the GLOBAL byte budget across files × chunks
+      (shrink the shared budget below the worker count → it binds)
+- [x] single-file / W<=1 stays on the sequential path (no shared budget threaded)
+- [x] concurrent state writes never corrupt batch_state (json.dumps race-free)
+- [x] download batch honors W and the shared budget too
+Live (`tests/test_live_concurrency.py`, saved session):
+- [x] directory of many files round-trips byte-exact under concurrency
+- [x] many-file directory upload is FASTER than the W=1 baseline (~3.1×)
+- [x] interrupted batch resumes correctly with concurrent files in flight
 
 ## Order of work
 Step 0 (done) → Step 1 in **filen-python first** (simpler: ThreadPoolExecutor) →
