@@ -435,8 +435,35 @@ Goal: N chunks in flight (start N=4–8), **semaphore-bounded** — never unboun
 Skip concurrency for **tiny files** (≤ a few chunks) — branch on size.
 
 ## Step 2 — file-level concurrency ⬜ TODO (sync / many small files)
-Parallelize whole files (not just chunks) for directory upload/download — often a
-bigger real-world win than chunk-level when syncing many small files.
+Parallelize whole FILES (not just chunks) in batch directory upload/download — the
+bigger real-world win when syncing many files. Reference: internxt-cli already does
+this (`cli.py` `ThreadPoolExecutor` + `--workers`, gated by
+`DriveService._mem_acquire`/`_mem_release`) — port that pattern.
+
+Files/functions:
+- `services/drive.py` → `upload(...)` (~line 833): the per-file `for task in tasks:`
+  loop. Run the per-file body on a `ThreadPoolExecutor(max_workers=W)` (W configurable,
+  default 4). Each file ALSO uses Step 1 chunk concurrency internally, so cap the
+  PRODUCT: total in-flight ≈ W files × N chunks. Either lower per-file
+  `max_concurrent_chunks` when W>1, or share ONE global byte-budget semaphore across
+  all files (preferred — mirrors filen-dart's single shared `MemoryGate`, below).
+- `services/drive.py` → `download_path(...)` (~line 1024): same treatment for the
+  per-file download loop.
+
+CONSTRAINTS:
+1. `batch_state` / `save_state_callback` is shared mutable state — guard task-status
+   writes with a `threading.Lock` (files complete out of order).
+2. Cap TOTAL bytes in flight across files × chunks (ONE shared budget), not per file —
+   else W×N×2 MB blows memory on mobile (CrispCloud).
+3. Conflict-check + `create_folder_recursive` / `_invalidate_cache` are shared — lock,
+   or pre-resolve parent folders once before fan-out.
+4. Keep progress output readable under concurrency (per-file lines interleave — lock
+   prints or give each worker a tqdm position).
+
+Tests (mirror `tests/test_chunk_concurrency.py` + `tests/test_live_concurrency.py`):
+Unit: a many-file batch never exceeds W concurrent files AND the global byte budget;
+state writes are race-free. Live: a directory of many files round-trips and is faster
+than the W=1 baseline.
 
 ## Test matrix — unit + live for everything
 Unit (hermetic; mocked session / MockClient):
