@@ -20,6 +20,10 @@ class APIClient:
         self.ingest_url = config_service.ingest_url
         self.egest_url = config_service.egest_url
         self.debug = False
+        # Single pooled session: keep-alive + connection reuse across every
+        # request and (via DriveService) every chunk transfer. Without this,
+        # each 1 MB chunk paid a fresh TCP+TLS handshake.
+        self.session = requests.Session()
 
     def set_auth(self, api_key: str) -> None:
         """Set authentication API key"""
@@ -68,12 +72,12 @@ class APIClient:
         for attempt in range(max_retries):
             try:
                 if method == 'GET':
-                    response = requests.get(url, headers=headers, timeout=30)
+                    response = self.session.get(url, headers=headers, timeout=30)
                 elif method == 'POST':
-                    response = requests.post(url, headers=headers, 
+                    response = self.session.post(url, headers=headers,
                                            json=data, timeout=30)
                 elif method == 'DELETE':
-                    response = requests.delete(url, headers=headers,
+                    response = self.session.delete(url, headers=headers,
                                              json=data, timeout=30)
                 else:
                     raise ValueError(f"Unsupported method: {method}")

@@ -1,3 +1,13 @@
 .git/
 **pycache**/
 *.pyc
+# Local dev virtualenv
+.venv/
+
+# Test / tooling artifacts
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
