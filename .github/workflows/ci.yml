@@ -1,0 +1,64 @@
+name: CI
+
+# Mirrors the internxt-cli sibling's CI gates. Live tests (real Filen backend)
+# self-skip without a saved session / FILEN_* creds, so a plain run is hermetic
+# here — no account secrets in GitHub Actions for a personal-use project.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      # Advisory until the fork's inherited type/security debt is paid down —
+      # surfaced as annotations without failing the build.
+      - name: Type check (mypy, advisory)
+        continue-on-error: true
+        run: mypy --no-incremental --ignore-missing-imports cli.py services config utils
+
+      - name: Security scan (bandit, advisory)
+        continue-on-error: true
+        run: bandit -r . -x ./.venv,./tests,./__pycache__,./debug -ll
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ \
+            --cov=services --cov=config --cov=utils \
+            --cov-report=term --cov-report=xml
+
+      - name: Upload coverage XML
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml

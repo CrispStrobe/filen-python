@@ -10,7 +10,8 @@ This is an unofficial, open-source project and is **not** affiliated with, endor
 
 ### 🔄 **Batching & Resume Support**
 
-  - ✅ **Chunk-level resume**: Interrupted uploads/downloads resume from the exact chunk where they stopped.
+  - ✅ **Chunk-level resume**: Interrupted uploads/downloads resume from the exact chunk where they stopped (tracked as a completed-index set, so out-of-order completion is safe).
+  - ✅ **Bounded chunk concurrency**: Uploads and downloads transfer multiple 1 MB chunks in parallel via a `ThreadPoolExecutor` + in-flight semaphore (`max_concurrent_chunks`, default 4). In-order hashing is preserved; tiny files stay sequential.
   - ✅ **Batch state persistence**: All progress saved automatically, survive crashes and network failures.
   - ✅ **Pattern filtering**: Include/exclude files with glob patterns during batch operations.
   - ✅ **Conflict handling**: Smart conflict resolution (skip/overwrite/newer) for uploads and downloads.
