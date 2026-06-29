@@ -377,3 +377,83 @@ Don't start cloud-python until Phase 4 lands here AND
 internxt-cli is pip-installable — it'd be built on unstable
 foundations otherwise. (internxt-cli is currently `python cli.py`,
 not pip-installable; that's the matching prerequisite.)
+
+---
+
+# Performance: connection reuse & concurrency (added 2026-06-29)
+
+Chunk upload/download was **sequential** AND opened a **fresh TCP+TLS
+connection per 1 MB chunk**. For a 1 GB file (~1000 chunks) that's ~1000
+handshakes, serialized. Two independent wins: (0) reuse connections, then
+(1) overlap chunks. Applies symmetrically to the sibling `filen-dart`.
+
+## Step 0 — connection reuse ✅ DONE & TESTED
+- `APIClient` holds one pooled `requests.Session` (`services/api.py`), used by
+  `_request` and shared with chunk transfers via `self.api.session.get/post`
+  (`services/drive.py`). Dead function-local `import requests` removed.
+- (dart sibling: chunk uploads now go through the pooled `api.client` instead of
+  the one-shot top-level `http.post` in `lib/upload.dart`; downloads already did.)
+- Tests: `tests/test_connection_reuse.py` (6 unit) + `tests/test_live_roundtrip.py`
+  (2 live, saved-session). All green. (dart: `test/connection_reuse_test.dart`
+  2 unit + `live_smoke` 7 live.)
+- Recovers the bulk of the loss at ~5% of the risk — no architecture change,
+  resume feature untouched.
+
+## Step 1 — bounded chunk concurrency ✅ DONE & TESTED
+- `services/drive.py`: `upload_file_chunked` now runs chunk POSTs on a bounded
+  `ThreadPoolExecutor` (`max_concurrent_chunks`, default 4). A sequential
+  producer reads+hashes plaintext in order; only the network POST is parallel.
+  In-flight is capped by a `threading.Semaphore` (≈ N×(1 MB plaintext + 1 MB
+  encrypted)). `download_file` fetches chunks concurrently and writes each at
+  its fixed offset. Tiny files (≤ 2 chunks) keep the sequential path.
+- Resume is now a **set**: `ChunkUploadException.completed_chunks` (+ `file_key`,
+  so resumed chunks share one key); batch state persists `completedChunks`.
+  `last_successful_chunk` kept as the contiguous-prefix high-water mark.
+- Tests: `tests/test_chunk_concurrency.py` (7 unit) + `tests/test_live_concurrency.py`
+  (4 live). All green; live throughput ~1.27× on a 16 MB file.
+
+Goal: N chunks in flight (start N=4–8), **semaphore-bounded** — never unbounded
+(→ server throttling + memory blowup). Mirrors filen-sdk-ts's `MAX_UPLOAD_THREADS`.
+- python: `ThreadPoolExecutor(max_workers=N)` — uploads are I/O-bound so the GIL
+  releases during socket I/O. (asyncio+aiohttp is a larger rewrite; defer.)
+- dart: N chunk `Future`s gated by a semaphore + the existing `MemoryGate`
+  (already byte-budget aware — repurpose from per-file to per-chunk).
+
+**Three constraints — do NOT just flip sequential→parallel:**
+1. **In-order hashing.** The file hash is a running SHA-512 over *plaintext
+   chunks in order*. Keep a sequential producer that reads+hashes in order, then
+   hands `(index, plaintext)` to the bounded upload pool. Reading+hashing is
+   cheap (disk/CPU); only the slow network upload is parallelized.
+2. **Resume becomes a set, not a high-water mark.** Today `resume_from_chunk=N`
+   assumes all `<N` are done. With out-of-order completion, track
+   `completed_chunks: Set[int]`; `ChunkUploadException(last_successful_chunk)`
+   carries the completed set instead. Protocol allows arbitrary chunk order.
+3. **Bound by BYTES in flight, not thread count** (critical on mobile/CrispCloud).
+   N concurrent chunks ≈ N×(1 MB plaintext + ~1 MB encrypted) live. Keep the
+   degree configurable, modest default on mobile.
+
+Skip concurrency for **tiny files** (≤ a few chunks) — branch on size.
+
+## Step 2 — file-level concurrency ⬜ TODO (sync / many small files)
+Parallelize whole files (not just chunks) for directory upload/download — often a
+bigger real-world win than chunk-level when syncing many small files.
+
+## Test matrix — unit + live for everything
+Unit (hermetic; mocked session / MockClient):
+- [x] chunk POST/GET routes through the pooled session
+- [x] bounded pool never exceeds N concurrent in-flight (assert peak concurrency)
+- [x] in-order hash: parallel uploads still produce the correct whole-file SHA-512
+- [x] resume-as-set: restart skips exactly completed indices, retries the gaps
+- [x] tiny-file path stays sequential
+- [x] memory ceiling: gate blocks once byte budget is exceeded
+Live (real backend, saved `~/.filen-cli` session):
+- [x] round-trip small file
+- [x] round-trip large multi-chunk file (8–16 MB); verify hash + content
+- [x] interrupted upload resumes and completes (kill mid-way, restart)
+- [x] concurrent throughput sanity (large file faster than sequential baseline)
+- [x] directory of many small files round-trips
+
+## Order of work
+Step 0 (done) → Step 1 in **filen-python first** (simpler: ThreadPoolExecutor) →
+port to filen-dart with MemoryGate → Step 2. Validate each against the matrix
+before advancing.

@@ -7,10 +7,33 @@ File operations for Filen with batching, resume, search, etc.
 import os
 import json
 import hashlib
+import threading
 import glob as glob_module
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Callable, Tuple, Iterator
+from typing import Dict, Any, List, Optional, Callable, Tuple, Iterator, Set
 from datetime import datetime
+
+# --- Chunk transfer concurrency (Step 1) -----------------------------------
+# N chunks may be in flight at once. Bounded by a semaphore so that at most
+# N×(plaintext + encrypted) chunks are ever live in memory — important on
+# mobile (CrispCloud). Modest defaults; both are per-file overridable.
+DEFAULT_UPLOAD_CONCURRENCY = 4
+DEFAULT_DOWNLOAD_CONCURRENCY = 4
+# Files with this many chunks or fewer keep the simple sequential path — no
+# thread pool is spun up (the overlap win doesn't pay for tiny files).
+SEQUENTIAL_CHUNK_THRESHOLD = 2
+
+
+def _contiguous_completed_max(completed: Set[int]) -> int:
+    """Largest M such that chunks 0..M are all in `completed` (else -1).
+
+    Used to express an out-of-order completed set as a backward-compatible
+    high-water mark (`last_successful_chunk`) for legacy resume callers."""
+    i = 0
+    while i in completed:
+        i += 1
+    return i - 1
 
 try:
     from tqdm import tqdm
@@ -25,13 +48,25 @@ from services.crypto import crypto_service
 
 
 class ChunkUploadException(Exception):
-    """Exception for chunk upload failures with resume info"""
-    def __init__(self, message: str, file_uuid: str, upload_key: str, 
-                 last_successful_chunk: int, original_error: Exception = None):
+    """Exception for chunk upload failures with resume info.
+
+    With concurrent chunk uploads, chunks complete out of order, so resume can
+    no longer assume "all chunks < N are done". `completed_chunks` carries the
+    exact set of indices that succeeded; `last_successful_chunk` is kept as the
+    contiguous-prefix high-water mark for backward-compatible callers.
+    """
+    def __init__(self, message: str, file_uuid: str, upload_key: str,
+                 last_successful_chunk: int, original_error: Exception = None,
+                 completed_chunks: Optional[Set[int]] = None,
+                 file_key: Optional[str] = None):
         self.message = message
         self.file_uuid = file_uuid
         self.upload_key = upload_key
         self.last_successful_chunk = last_successful_chunk
+        self.completed_chunks = set(completed_chunks) if completed_chunks else set()
+        # The file key must be carried so a resumed upload reuses it — chunks
+        # already on the server were encrypted with it.
+        self.file_key = file_key
         self.original_error = original_error
         super().__init__(message)
 
@@ -98,7 +133,6 @@ class DriveService:
         """
         Yields decrypted file bytes for streaming (WebDAV support).
         """
-        import requests
         
         # Get metadata and decrypt
         metadata = self.api.get_file_metadata(file_uuid)
@@ -135,7 +169,7 @@ class DriveService:
                 break
 
             url = f"{self.config.egest_url}/{region}/{bucket}/{file_uuid}/{i}"
-            response = requests.get(url, stream=True, timeout=30)
+            response = self.api.session.get(url, stream=True, timeout=30)
             
             if response.status_code != 200:
                 raise Exception(f"Chunk download failed: {response.status_code}")
@@ -498,13 +532,16 @@ class DriveService:
         resume_from_chunk: int = 0,
         preserve_timestamps: bool = False,
         on_progress: Optional[Callable[[int, int, int, int], None]] = None,
-        on_upload_start: Optional[Callable[[str, str], None]] = None,
-        target_filename: Optional[str] = None  # for webdav override
+        on_upload_start: Optional[Callable[[str, str, str], None]] = None,
+        target_filename: Optional[str] = None,  # for webdav override
+        completed_chunks: Optional[Set[int]] = None,
+        on_chunks_completed: Optional[Callable[[Set[int]], None]] = None,
+        max_concurrent_chunks: int = DEFAULT_UPLOAD_CONCURRENCY,
+        file_key: Optional[str] = None,
     ) -> Dict[str, str]:
         """
         Upload file in chunks with resume support
         """
-        import requests
         
         # Use target_filename if provided (WebDAV), otherwise use file system name (CLI)
         filename = target_filename if target_filename else os.path.basename(file_path)
@@ -513,8 +550,10 @@ class DriveService:
         uuid = file_uuid or self.crypto.generate_uuid()
         master_key = self._get_master_key()
         
-        # Generate file key
-        file_key_str = self.crypto.random_string(32)
+        # File key: reuse the caller-supplied key when resuming so chunks
+        # uploaded across attempts share one key (otherwise the already-uploaded
+        # chunks would be undecryptable). Generate a fresh one for new uploads.
+        file_key_str = file_key or self.crypto.random_string(32)
         file_key_bytes = file_key_str.encode('utf-8')
         
         # Get modification time
@@ -560,88 +599,56 @@ class DriveService:
         upload_key = upload_key or self.crypto.random_string(32)
         
         # Notify on upload start
-        if on_upload_start and resume_from_chunk == 0:
-            on_upload_start(uuid, upload_key)
+        if on_upload_start and resume_from_chunk == 0 and not completed_chunks:
+            on_upload_start(uuid, upload_key, file_key_str)
         
         chunk_size = 1048576  # 1MB
         total_chunks = (file_size + chunk_size - 1) // chunk_size
-        
+
+        # Resume is a SET of completed indices, not a high-water mark: with
+        # concurrent uploads chunks finish out of order, so "all < N done" is
+        # no longer true. `resume_from_chunk` (legacy callers) folds in as a
+        # contiguous range; `completed_chunks` carries an exact set.
+        done_chunks: Set[int] = set(completed_chunks) if completed_chunks else set()
         if resume_from_chunk > 0:
-            self._log(f"RESUMING upload from chunk {resume_from_chunk}")
-            self._log(f"  UUID: {uuid}")
-            self._log(f"  Upload Key: {upload_key[:8]}...")
-            self._log(f"  Total chunks: {total_chunks}")
+            done_chunks |= set(range(resume_from_chunk))
+
+        if done_chunks:
+            self._log(f"RESUMING upload — {len(done_chunks)} chunk(s) already done")
         else:
-            self._log(f"STARTING new upload")
-            self._log(f"  UUID: {uuid}")
-            self._log(f"  Upload Key: {upload_key[:8]}...")
-            self._log(f"  Total chunks: {total_chunks}")
-        
-        # Hash file
+            self._log("STARTING new upload")
+        self._log(f"  UUID: {uuid}")
+        self._log(f"  Upload Key: {upload_key[:8]}...")
+        self._log(f"  Total chunks: {total_chunks}")
+
+        # Running SHA-512 over the *plaintext* chunks, in order. This cannot be
+        # parallelized — a sequential producer reads+hashes each chunk in order
+        # (cheap) and hands the slow network upload to the bounded pool.
         hasher = hashlib.sha512()
-        
+
+        # Tiny files (and concurrency disabled) keep the simple sequential
+        # path: no thread pool is created.
+        use_concurrency = (
+            max_concurrent_chunks > 1 and total_chunks > SEQUENTIAL_CHUNK_THRESHOLD
+        )
+
         with open(file_path, 'rb') as f:
-            # Re-hash previous chunks if resuming
-            if resume_from_chunk > 0:
-                self._log(f"Re-hashing previous {resume_from_chunk} chunks...")
-                for i in range(resume_from_chunk):
-                    chunk = f.read(chunk_size)
-                    hasher.update(chunk)
-                self._log("Re-hashing complete, resuming upload")
-            
-            # Upload chunks
-            chunk_index = resume_from_chunk
-            
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                
-                # Update hash
-                hasher.update(chunk)
-                
-                # Encrypt chunk
-                encrypted_chunk = self.crypto.encrypt_data(chunk, file_key_bytes)
-                
-                # Calculate chunk hash
-                chunk_hash = hashlib.sha512(encrypted_chunk).hexdigest().lower()
-                
-                # Upload chunk
-                url = (f"{self.config.ingest_url}/v3/upload?"
-                      f"uuid={uuid}&index={chunk_index}&parent={parent_uuid}"
-                      f"&uploadKey={upload_key}&hash={chunk_hash}")
-                
-                headers = {'Authorization': f'Bearer {self.api.api_key}'}
-                
-                # Progress
-                if on_progress:
-                    bytes_uploaded = min((chunk_index + 1) * chunk_size, file_size)
-                    on_progress(chunk_index + 1, total_chunks, bytes_uploaded, file_size)
-                else:
-                    progress = ((chunk_index + 1) / total_chunks * 100)
-                    # print(f"     Uploading... {chunk_index + 1}/{total_chunks} chunks ({progress:.1f}%)  ", end='\r')
-                
-                try:
-                    response = requests.post(url, data=encrypted_chunk, headers=headers, timeout=30)
-                    
-                    if response.status_code != 200:
-                        raise Exception(f"Chunk upload failed: {response.status_code} - {response.text}")
-                    
-                except Exception as e:
-                    self._log(f"Chunk {chunk_index} failed: {e}")
-                    # Raise ChunkUploadException with resume info
-                    raise ChunkUploadException(
-                        f"Chunk {chunk_index} upload failed",
-                        file_uuid=uuid,
-                        upload_key=upload_key,
-                        last_successful_chunk=chunk_index - 1,
-                        original_error=e
-                    )
-                
-                chunk_index += 1
-        
-        # print()  # Clear progress line
-        
+            if use_concurrency:
+                self._upload_chunks_concurrent(
+                    f, file_size, chunk_size, total_chunks, done_chunks, hasher,
+                    file_key_bytes, uuid, upload_key, parent_uuid,
+                    max_concurrent_chunks, on_progress, on_chunks_completed,
+                )
+            else:
+                self._upload_chunks_sequential(
+                    f, file_size, chunk_size, total_chunks, done_chunks, hasher,
+                    file_key_bytes, uuid, upload_key, parent_uuid,
+                    on_progress, on_chunks_completed,
+                )
+
+        # Every chunk (whatever the order) is uploaded before we finalize.
+        chunk_index = total_chunks
+
         # Get final hash
         total_hash = hasher.hexdigest().lower()
         
@@ -675,6 +682,131 @@ class DriveService:
             'hash': total_hash,
             'size': str(file_size)
         }
+
+    # ------------------------------------------------------------------------
+    # Chunk upload workers (sequential + bounded-concurrent), shared by
+    # upload_file_chunked. Both run a single in-order producer (read + running
+    # SHA-512) and differ only in how the per-chunk network POST is dispatched.
+    # ------------------------------------------------------------------------
+
+    def _upload_one_chunk(self, index: int, plaintext: bytes, file_key_bytes: bytes,
+                          uuid: str, upload_key: str, parent_uuid: str) -> None:
+        """Encrypt + POST a single chunk through the pooled session.
+
+        Stateless apart from the shared session/crypto (both thread-safe), so it
+        is safe to call from worker threads. Raises on a non-200 response."""
+        encrypted_chunk = self.crypto.encrypt_data(plaintext, file_key_bytes)
+        chunk_hash = hashlib.sha512(encrypted_chunk).hexdigest().lower()
+        url = (f"{self.config.ingest_url}/v3/upload?"
+               f"uuid={uuid}&index={index}&parent={parent_uuid}"
+               f"&uploadKey={upload_key}&hash={chunk_hash}")
+        headers = {'Authorization': f'Bearer {self.api.api_key}'}
+        response = self.api.session.post(url, data=encrypted_chunk, headers=headers, timeout=30)
+        if response.status_code != 200:
+            raise Exception(f"Chunk upload failed: {response.status_code} - {response.text}")
+
+    def _report_upload_progress(self, completed: Set[int], total_chunks: int,
+                                chunk_size: int, file_size: int,
+                                on_progress, on_chunks_completed) -> None:
+        num_done = len(completed)
+        if on_progress:
+            bytes_done = min(num_done * chunk_size, file_size)
+            on_progress(num_done, total_chunks, bytes_done, file_size)
+        if on_chunks_completed:
+            on_chunks_completed(completed)
+
+    def _upload_chunks_sequential(self, f, file_size, chunk_size, total_chunks,
+                                  done_chunks, hasher, file_key_bytes, uuid,
+                                  upload_key, parent_uuid, on_progress,
+                                  on_chunks_completed) -> Set[int]:
+        completed: Set[int] = set(done_chunks)
+        index = 0
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)  # in-order plaintext hash
+            if index in done_chunks:
+                index += 1
+                continue
+            try:
+                self._upload_one_chunk(index, chunk, file_key_bytes, uuid,
+                                       upload_key, parent_uuid)
+            except Exception as e:
+                self._log(f"Chunk {index} failed: {e}")
+                raise ChunkUploadException(
+                    f"Chunk {index} upload failed",
+                    file_uuid=uuid, upload_key=upload_key,
+                    last_successful_chunk=_contiguous_completed_max(completed),
+                    completed_chunks=completed, original_error=e,
+                    file_key=file_key_bytes.decode('utf-8', 'ignore'),
+                )
+            completed.add(index)
+            self._report_upload_progress(completed, total_chunks, chunk_size,
+                                         file_size, on_progress, on_chunks_completed)
+            index += 1
+        return completed
+
+    def _upload_chunks_concurrent(self, f, file_size, chunk_size, total_chunks,
+                                  done_chunks, hasher, file_key_bytes, uuid,
+                                  upload_key, parent_uuid, max_concurrent_chunks,
+                                  on_progress, on_chunks_completed) -> Set[int]:
+        completed: Set[int] = set(done_chunks)
+        lock = threading.Lock()
+        errors: List[Tuple[int, Exception]] = []
+        # Bound chunks-in-flight to N so at most N×(plaintext+encrypted) bytes
+        # are live at once. The producer blocks on this semaphore — that is the
+        # memory ceiling, independent of pool size.
+        slots = threading.Semaphore(max_concurrent_chunks)
+
+        def worker(index: int, plaintext: bytes):
+            try:
+                self._upload_one_chunk(index, plaintext, file_key_bytes, uuid,
+                                       upload_key, parent_uuid)
+                with lock:
+                    completed.add(index)
+                    snapshot = set(completed)
+                self._report_upload_progress(snapshot, total_chunks, chunk_size,
+                                             file_size, on_progress, on_chunks_completed)
+            except Exception as e:  # noqa: BLE001 — recorded, surfaced after join
+                with lock:
+                    errors.append((index, e))
+            finally:
+                slots.release()
+
+        with ThreadPoolExecutor(max_workers=max_concurrent_chunks) as executor:
+            index = 0
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                hasher.update(chunk)  # in-order plaintext hash (sequential)
+                if index in done_chunks:
+                    index += 1
+                    continue
+                with lock:
+                    if errors:
+                        break
+                slots.acquire()  # memory + concurrency bound
+                with lock:
+                    if errors:
+                        slots.release()
+                        break
+                executor.submit(worker, index, chunk)
+                index += 1
+            # Leaving the context manager joins all in-flight workers.
+
+        if errors:
+            index, err = min(errors, key=lambda t: t[0])
+            self._log(f"Chunk {index} failed: {err}")
+            raise ChunkUploadException(
+                f"Chunk {index} upload failed",
+                file_uuid=uuid, upload_key=upload_key,
+                last_successful_chunk=_contiguous_completed_max(completed),
+                completed_chunks=completed, original_error=err,
+                file_key=file_key_bytes.decode('utf-8', 'ignore'),
+            )
+        return completed
 
     # ============================================================================
     # BATCH UPLOAD WITH RESUME
@@ -876,60 +1008,78 @@ class DriveService:
                 # Upload
                 try:
                     file_size = os.path.getsize(local_path)
-                    is_resuming = (status in ['interrupted', 'uploading']) and task.get('lastChunk', -1) >= 0
-                    
+                    # Resume state is a SET of completed indices ('completedChunks').
+                    # Legacy state files only carry 'lastChunk' (a high-water mark
+                    # written by the old sequential code) — fold it into the set.
+                    resume_completed: Set[int] = set(task.get('completedChunks') or [])
+                    if task.get('lastChunk', -1) >= 0:
+                        resume_completed |= set(range(task['lastChunk'] + 1))
+                    is_resuming = (status in ['interrupted', 'uploading']) and bool(resume_completed)
+
                     if self.debug:
                         if is_resuming:
                             print(f"📤 Resuming: {remote_filename} ({format_size(file_size)})")
                         else:
                             print(f"📤 Uploading: {remote_filename} ({format_size(file_size)})")
-                    
+
                     task['status'] = 'uploading'
                     if save_state_callback: save_state_callback(batch_state)
-                    
+
                     last_save_time = datetime.now()
-                    last_saved_chunk = task.get('lastChunk', -1)
-                    
-                    def on_upload_start_handler(uuid: str, key: str):
+                    last_saved_count = len(resume_completed)
+                    state_lock = threading.Lock()
+
+                    def on_upload_start_handler(uuid: str, key: str, fkey: str):
                         # self._log(f"Upload initiated: {uuid}")
                         task['fileUuid'] = uuid
                         task['uploadKey'] = key
+                        task['fileKey'] = fkey
                         task['lastChunk'] = -1
+                        task['completedChunks'] = []
                         if save_state_callback: save_state_callback(batch_state)
-                    
-                    def on_progress_handler(current: int, total: int, bytes_up: int, total_bytes: int):
-                        nonlocal last_save_time, last_saved_chunk
-                        task['lastChunk'] = current - 1
-                        now = datetime.now()
-                        if (current - last_saved_chunk >= 10) or (now - last_save_time).seconds >= 5:
-                            if save_state_callback: save_state_callback(batch_state)
-                            last_save_time = now
-                            last_saved_chunk = current - 1
-                    
+
+                    def on_chunks_completed_handler(done: Set[int]):
+                        # Fired from worker threads as chunks finish (out of order).
+                        # Persist the exact set + a contiguous high-water mark
+                        # (legacy-safe), throttled to avoid hammering the state file.
+                        nonlocal last_save_time, last_saved_count
+                        with state_lock:
+                            task['completedChunks'] = sorted(done)
+                            task['lastChunk'] = _contiguous_completed_max(done)
+                            now = datetime.now()
+                            if (len(done) - last_saved_count >= 10) or (now - last_save_time).seconds >= 5:
+                                if save_state_callback: save_state_callback(batch_state)
+                                last_save_time = now
+                                last_saved_count = len(done)
+
                     self.upload_file_chunked(
                         local_path,
                         parent_info['uuid'],
                         file_uuid=task.get('fileUuid'),
                         upload_key=task.get('uploadKey'),
-                        resume_from_chunk=(task.get('lastChunk', -1) + 1) if is_resuming else 0,
+                        file_key=task.get('fileKey') if is_resuming else None,
+                        completed_chunks=resume_completed if is_resuming else None,
                         preserve_timestamps=preserve_timestamps,
                         on_upload_start=on_upload_start_handler if not is_resuming else None,
-                        on_progress=on_progress_handler
+                        on_chunks_completed=on_chunks_completed_handler
                     )
-                    
+
                     if self.debug:
                         print(f"   ✅ Complete: {remote_filename}")
-                    
+
                     success_count += 1
                     task['status'] = 'completed'
                     task['fileUuid'] = None
                     task['uploadKey'] = None
                     task['lastChunk'] = -1
-                    
+                    task['completedChunks'] = []
+
                 except ChunkUploadException as e:
                     if self.debug: print(f"\n⚠️  Interrupted: {e.message}")
                     task['fileUuid'] = e.file_uuid
                     task['uploadKey'] = e.upload_key
+                    task['fileKey'] = e.file_key
+                    task['completedChunks'] = sorted(e.completed_chunks)
                     task['lastChunk'] = e.last_successful_chunk
                     task['status'] = 'interrupted'
                     error_count += 1
@@ -955,11 +1105,11 @@ class DriveService:
 
     def download_file(self, file_uuid: str, save_path: Optional[str] = None,
                      on_progress: Optional[Callable[[int, int], None]] = None,
-                     quiet: bool = False) -> Dict[str, Any]:
+                     quiet: bool = False,
+                     max_concurrent_chunks: int = DEFAULT_DOWNLOAD_CONCURRENCY) -> Dict[str, Any]:
         """
         Download file from Filen
         """
-        import requests
         
         self._log(f"Downloading file: {file_uuid}")
         
@@ -993,32 +1143,89 @@ class DriveService:
         
         # Download and decrypt chunks
         target_path = save_path or filename
-        
-        bytes_downloaded = 0
-        
-        with open(target_path, 'wb') as f:
-            for i in range(chunks):
-                url = f"{self.config.egest_url}/{region}/{bucket}/{file_uuid}/{i}"
-                
-                response = requests.get(url, timeout=30)
-                if response.status_code != 200:
-                    raise Exception(f"Chunk download failed: {response.status_code}")
-                
-                # Decrypt chunk
-                decrypted = self.crypto.decrypt_data(response.content, file_key_bytes)
-                f.write(decrypted)
-                
-                bytes_downloaded += len(decrypted)
-                
-                if on_progress:
-                    on_progress(bytes_downloaded, file_size)
-        
+
+        # Tiny files keep the simple sequential path; larger ones fetch chunks
+        # with a bounded pool. Writes go to per-chunk file offsets (every
+        # plaintext chunk is exactly 1 MB except the last), so out-of-order
+        # completion still reassembles the file correctly.
+        use_concurrency = (
+            max_concurrent_chunks > 1 and chunks > SEQUENTIAL_CHUNK_THRESHOLD
+        )
+
+        if use_concurrency:
+            self._download_chunks_concurrent(
+                target_path, file_uuid, region, bucket, chunks, file_key_bytes,
+                int(file_size or 0), max_concurrent_chunks, on_progress,
+            )
+        else:
+            bytes_downloaded = 0
+            with open(target_path, 'wb') as f:
+                for i in range(chunks):
+                    decrypted = self._download_one_chunk(
+                        file_uuid, region, bucket, i, file_key_bytes)
+                    f.write(decrypted)
+                    bytes_downloaded += len(decrypted)
+                    if on_progress:
+                        on_progress(bytes_downloaded, file_size)
+
         return {
             'filename': filename,
             'size': file_size,
             'path': target_path,
             'lastModified': last_modified
         }
+
+    # 1 MB plaintext per chunk — fixed by the protocol; the last chunk is
+    # shorter but always last, so index*PLAINTEXT is the correct file offset.
+    _DOWNLOAD_CHUNK_PLAINTEXT = 1048576
+
+    def _download_one_chunk(self, file_uuid: str, region: str, bucket: str,
+                            index: int, file_key_bytes: bytes) -> bytes:
+        """Fetch + decrypt one chunk through the pooled session (thread-safe)."""
+        url = f"{self.config.egest_url}/{region}/{bucket}/{file_uuid}/{index}"
+        response = self.api.session.get(url, timeout=30)
+        if response.status_code != 200:
+            raise Exception(f"Chunk download failed: {response.status_code}")
+        return self.crypto.decrypt_data(response.content, file_key_bytes)
+
+    def _download_chunks_concurrent(self, target_path, file_uuid, region, bucket,
+                                    chunks, file_key_bytes, file_size,
+                                    max_concurrent_chunks, on_progress) -> None:
+        plaintext = self._DOWNLOAD_CHUNK_PLAINTEXT
+        lock = threading.Lock()
+        errors: List[Tuple[int, Exception]] = []
+        progress = {'bytes': 0}
+
+        with open(target_path, 'wb') as f:
+            # Pre-size so concurrent offset writes never clobber each other.
+            if file_size:
+                f.truncate(file_size)
+
+            def worker(i: int):
+                if errors:  # fail fast — stop fetching once something broke
+                    return
+                try:
+                    decrypted = self._download_one_chunk(
+                        file_uuid, region, bucket, i, file_key_bytes)
+                    with lock:
+                        f.seek(i * plaintext)
+                        f.write(decrypted)
+                        progress['bytes'] += len(decrypted)
+                        done = progress['bytes']
+                    if on_progress:
+                        on_progress(done, file_size)
+                except Exception as e:  # noqa: BLE001 — surfaced after join
+                    with lock:
+                        errors.append((i, e))
+
+            # ThreadPoolExecutor bounds in-flight (and thus decrypted bytes in
+            # memory) to max_workers — at most N×~1 MB live at once.
+            with ThreadPoolExecutor(max_workers=max_concurrent_chunks) as executor:
+                list(executor.map(worker, range(chunks)))
+
+        if errors:
+            i, err = min(errors, key=lambda t: t[0])
+            raise Exception(f"Chunk {i} download failed: {err}")
 
     # ============================================================================
     # BATCH DOWNLOAD WITH RESUME
